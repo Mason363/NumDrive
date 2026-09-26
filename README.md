@@ -1,8 +1,8 @@
-# Drive Mad for NumWorks
+# NumDrive: Drive Mad for NumWorks
 
-Drive Mad, the Fancade driving game, on the NumWorks N0120 calculator.
+NumDrive is a Drive Mad style driving game for the NumWorks N0120 calculator.
 
-157 levels from the original, with the same cars, physics puzzles, bridges, water and look.
+157 levels of cars, physics puzzles, bridges and water, in a 240 KB app.
 
 <p align="center">
   <img src="docs/shot1.png" width="320"> <img src="docs/shot2.png" width="320">
@@ -12,10 +12,10 @@ Drive Mad, the Fancade driving game, on the NumWorks N0120 calculator.
 
 ## Install
 
-1. Download `DriveMad.nwa` from the [latest release](https://github.com/Mason363/NumDrive/releases/latest).
+1. Download `NumDrive.nwa` from the [latest release](https://github.com/Mason363/NumDrive/releases/latest).
 2. Plug your calculator into a computer and open [my.numworks.com/apps](https://my.numworks.com/apps) in Chrome or Edge.
-3. Upload `DriveMad.nwa` and send it to the calculator.
-4. Open Drive Mad from the home screen.
+3. Upload `NumDrive.nwa` and send it to the calculator.
+4. Open NumDrive from the home screen.
 
 ## Controls
 
@@ -38,8 +38,10 @@ You need `arm-none-eabi-gcc` and Node.js.
 make
 ```
 
-The app is written to `output/device/drivemad.nwa`.
+The app is written to `output/device/numdrive.nwa`.
 
 ## Credits
 
-Drive Mad was made by Martin Magni with [Fancade](https://www.fancade.com). This is an unofficial fan port and is not affiliated with Fancade. Levels and art come from the original game.
+Made by Mason Chen. Inspired by Drive Mad.
+
+This is an unofficial fan game and is not affiliated with the makers of Drive Mad.
