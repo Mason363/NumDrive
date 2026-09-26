@@ -384,6 +384,32 @@ static void shape_finish(Shape *s) {
     if (b->flags & 3) coll = 1;
   }
   s->mass = m / 512.0f;
+#ifdef HOST
+  {
+    static float vm = -1;
+    if (vm < 0) vm = getenv("ND_VOXMASS") ? atof(getenv("ND_VOXMASS")) : 1;
+    s->mass *= vm;
+    if (getenv("ND_BOXMASS")) {
+      float v = 0;
+      for (int i = 0; i < s->np; i++) {
+        const uint8_t *bb = blocks[s->blk[i]]->bb + PK_C(s->key[i]) * 6;
+        if (bb[0] <= bb[3]) v += (bb[3] - bb[0] + 1) * (bb[4] - bb[1] + 1) * (bb[5] - bb[2] + 1) / 512.0f;
+      }
+      s->mass = v;
+    }
+    if (getenv("ND_CELLMASS")) {
+      int cells = 0;
+      float cx = 0, cy = 0, cz = 0;
+      for (int i = 0; i < s->np; i++)
+        if (i == 0 || (s->key[i] & ~7u) != (s->key[i - 1] & ~7u)) {
+          cells++;
+          cx += PK_X(s->key[i]) + 0.5f, cy += PK_Y(s->key[i]) + 0.5f, cz += PK_Z(s->key[i]) + 0.5f;
+        }
+      s->mass = cells;
+      if (atoi(getenv("ND_CELLMASS")) == 2 && cells) s->com = v3(cx / cells, cy / cells, cz / cells);
+    }
+  }
+#endif
   s->com = m > 0 ? v3(sx / m / 8, sy / m / 8, sz / m / 8) : v3(0, 0, 0);
   {
     /* Fancade's object position: the centre of its bounds, where a stock block counts its whole cell
@@ -406,6 +432,9 @@ static void shape_finish(Shape *s) {
     for (int i = 1; i < s->np && one; i++) one = (s->key[i] & ~7u) == (s->key[0] & ~7u);
     if (s->np && one) s->origin = v3(PK_X(s->key[0]) + 0.5f, PK_Y(s->key[0]) + 0.5f, PK_Z(s->key[0]) + 0.5f);
   }
+#ifdef HOST
+  if (getenv("ND_COMORIGIN")) s->com = s->origin;
+#endif
   s->bmin = v3(bx0 / 8, by0 / 8, bz0 / 8);
   s->bmax = v3(bx1 / 8, by1 / 8, bz1 / 8);
   s->coll = coll;
@@ -634,6 +663,9 @@ bool world_load_level(int index) {
   arena_reset();
   nmat = 0;
   mat_find(0.5f, 0.0f); /* index 0: Fancade's defaults */
+#ifdef HOST
+  if (getenv("ND_OBJFRIC")) mat_tab[0][0] = atof(getenv("ND_OBJFRIC"));
+#endif
   memset(blocks, 0, sizeof blocks);
   memset(need_blk, 0, sizeof need_blk);
   nobj = 0;

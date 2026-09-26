@@ -596,6 +596,13 @@ void phys_set_locked(int o, const vec3 *p, const vec3 *r) {
 }
 
 void phys_set_mass(int o, float m) {
+#ifdef HOST
+  {
+    static float sm = -1;
+    if (sm < 0) sm = getenv("ND_SETMASS") ? atof(getenv("ND_SETMASS")) : 1;
+    m *= sm;
+  }
+#endif
   objs[o].mass = m;
   Body *b = wake(o);
   if (b) body_mass(b);
@@ -716,6 +723,14 @@ static JointExt *joint_ext(int c) {
 void phys_con_spring(int c, bool ang, vec3 k, vec3 d) {
   JointExt *x = joint_ext(c);
   if (!x) return;
+#ifdef HOST
+  {
+    static float ks = -1, kd = -1;
+    if (ks < 0) ks = getenv("ND_KSPR") ? atof(getenv("ND_KSPR")) : 1, kd = getenv("ND_KDMP") ? atof(getenv("ND_KDMP")) : 1;
+    k = vscale(k, ks);
+    d = vscale(d, kd);
+  }
+#endif
   Joint *j = &joints[c];
   if (ang) {
     x->k[2] = k.z;
@@ -1145,8 +1160,15 @@ static bool joined(int a, int b) {
   return false;
 }
 
+/* like Bullet, a body does not collide with the static object its constraint is attached to */
+static bool joined_static(int bi, int s) {
+  for (int j = 0; j < njoints; j++)
+    if (joints[j].a < 0 && joints[j].sobj == s && joints[j].b == bi) return true;
+  return false;
+}
+
 static float mix_friction(float a, float b) {
-  float f = a * b * 1.05f;
+  float f = a * b; /* Bullet's combined friction */
 #ifdef HOST
   f *= k_fmul;
 #endif
@@ -1188,6 +1210,7 @@ static void gen_contacts(void) {
     for (int s = 0; s < nobj; s++) {
       Obj *os = &objs[s];
       if ((os->flags & (OF_DYNAMIC | OF_DEAD | OF_TEMPLATE | OF_COLLIDE | OF_VISIBLE)) != (OF_COLLIDE | OF_VISIBLE)) continue;
+      if (joined_static(i, s)) continue;
       /* AABB check in world */
       const Shape *sh = os->shape;
       vec3 c = obj_world(os, vscale(vadd(sh->bmin, sh->bmax), 0.5f));

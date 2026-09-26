@@ -276,6 +276,9 @@ static void env_block_pose(Env *e, vec3 *pos, quat *rot) {
     Obj *o = &objs[e->anchor];
     *pos = vadd(o->pos, vsub(shape_block_center(o->shape, e->bx, e->by, e->bz), o->shape->origin));
     *rot = o->rot;
+  } else if (e->parent != NONE16 && !envs[e->parent].prog->is_level) {
+    /* not part of an object in its custom block: the enclosing block's position */
+    env_block_pose(&envs[e->parent], pos, rot);
   } else {
     *pos = rest;
     *rot = qident();
