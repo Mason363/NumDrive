@@ -14,5 +14,5 @@ one() {
   echo "$i $mo $mb $mj"
 }
 if [ -n "$1" ]; then one "$1"; exit; fi
-seq 0 199 | xargs -P 8 -I{} "$0" {} | sort -n > ../tools/caps.txt.tmp
+seq 0 199 | xargs -P 3 -I{} "$0" {} | sort -n > ../tools/caps.txt.tmp
 mv ../tools/caps.txt.tmp ../tools/caps.txt

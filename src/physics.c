@@ -125,6 +125,20 @@ static void part_sphere(const Block *b, int comp, uint32_t k, vec3 *c, float *r)
   *c = v3(PK_X(k) + (bb[0] + bb[3] + 1) / 16.0f, PK_Y(k) + (bb[1] + bb[4] + 1) / 16.0f, PK_Z(k) + (bb[2] + bb[5] + 1) / 16.0f);
 }
 
+/* is the rest-space point inside a box collider of the shape? */
+static bool shape_solid_at(const Shape *sh, vec3 l) {
+  int cx = (int)floorf(l.x), cy = (int)floorf(l.y), cz = (int)floorf(l.z);
+  int pj = shape_find(sh, cx, cy, cz);
+  for (int j = pj; pj >= 0 && j < sh->np && (sh->key[j] & ~7u) == (sh->key[pj] & ~7u); j++) {
+    const Block *nb = blocks[sh->blk[j]];
+    if ((nb->flags & 3) != 1) continue;
+    const uint8_t *bb = nb->bb + PK_C(sh->key[j]) * 6;
+    float vx = (l.x - cx) * 8, vy = (l.y - cy) * 8, vz = (l.z - cz) * 8;
+    if (vx >= bb[0] && vx <= bb[3] + 1 && vy >= bb[1] && vy <= bb[4] + 1 && vz >= bb[2] && vz <= bb[5] + 1) return true;
+  }
+  return false;
+}
+
 static bool ray_part(const Shape *s, int pi, vec3 o, vec3 d, float *best) {
   const Block *b = blocks[s->blk[pi]];
   int coll = b->flags & 3;
@@ -150,6 +164,10 @@ static bool ray_part(const Shape *s, int pi, vec3 o, vec3 d, float *best) {
   vec3 mn = v3(cx + bb[0] / 8.0f, cy + bb[1] / 8.0f, cz + bb[2] / 8.0f);
   vec3 mx = v3(cx + (bb[3] + 1) / 8.0f, cy + (bb[4] + 1) / 8.0f, cz + (bb[5] + 1) / 8.0f);
   if (ray_box(o, d, mn, mx, &t) && t < *best) {
+    /* entering through a face shared with another box of the object (Fancade merges them) */
+    float dl = sqrtf(vdot(d, d));
+    float e = dl > 1e-9f ? 0.01f / dl : 0;
+    if (t > e && shape_solid_at(s, vadd(o, vscale(d, t - e)))) return false;
     *best = t;
     hit = true;
   }
@@ -875,6 +893,79 @@ static void collide_elems(const WElem *a, const WElem *b) {
   else col_bb(a, b);
 }
 
+/* a box with half axes a, b, e (any 3D orientation) as a rectangle in the plane: its outline along
+   the axis that projects longest, and its z range */
+static void box_welem(vec3 c, vec3 a, vec3 b, vec3 e, WElem *w) {
+  float la = a.x * a.x + a.y * a.y, lb = b.x * b.x + b.y * b.y, le = e.x * e.x + e.y * e.y;
+  float ux = a.x, uy = a.y, l = la;
+  if (lb > l) ux = b.x, uy = b.y, l = lb;
+  if (le > l) ux = e.x, uy = e.y, l = le;
+  l = sqrtf(l);
+  if (l < 1e-6f) ux = 1, uy = 0;
+  else ux /= l, uy /= l;
+  w->circle = 0;
+  w->cx = c.x;
+  w->cy = c.y;
+  w->ux = ux;
+  w->uy = uy;
+  w->hx = fabsf(a.x * ux + a.y * uy) + fabsf(b.x * ux + b.y * uy) + fabsf(e.x * ux + e.y * uy);
+  w->hy = fabsf(a.y * ux - a.x * uy) + fabsf(b.y * ux - b.x * uy) + fabsf(e.y * ux - e.x * uy);
+  float hz = fabsf(a.z) + fabsf(b.z) + fabsf(e.z);
+  w->z0 = c.z - hz;
+  w->z1 = c.z + hz;
+}
+
+/* dynamic element vs a static object turned about x or y: its parts' outlines in world space */
+static void collide_static_3d(const WElem *we, int so) {
+  Obj *s = &objs[so];
+  const Shape *sh = s->shape;
+  vec3 ax = qrot(s->rot, v3(1, 0, 0)), ay = qrot(s->rot, v3(0, 1, 0)), az = qrot(s->rot, v3(0, 0, 1));
+  float ext = we->circle ? we->hx : sqrtf(we->hx * we->hx + we->hy * we->hy);
+  for (int i = 0; i < sh->np; i++) {
+    const Block *bk = blocks[sh->blk[i]];
+    int coll = bk->flags & 3;
+    if (!coll) continue;
+    uint32_t k = sh->key[i];
+    int comp = PK_C(k);
+    WElem se;
+    if (coll == 2) {
+      vec3 c;
+      float r;
+      part_sphere(bk, comp, k, &c, &r);
+      c = obj_world(s, c);
+      if (fabsf(c.x - we->cx) > r + ext || fabsf(c.y - we->cy) > r + ext) continue;
+      se.circle = 1;
+      se.cx = c.x;
+      se.cy = c.y;
+      se.hx = se.hy = r;
+      se.ux = 1;
+      se.uy = 0;
+      se.z0 = c.z - r;
+      se.z1 = c.z + r;
+    } else {
+      const uint8_t *bb = bk->bb + comp * 6;
+      if (bb[0] > bb[3]) continue;
+      float hx = (bb[3] + 1 - bb[0]) / 16.0f, hy = (bb[4] + 1 - bb[1]) / 16.0f, hz = (bb[5] + 1 - bb[2]) / 16.0f;
+      vec3 lc = v3(PK_X(k) + (bb[0] + bb[3] + 1) / 16.0f, PK_Y(k) + (bb[1] + bb[4] + 1) / 16.0f, PK_Z(k) + (bb[2] + bb[5] + 1) / 16.0f);
+      vec3 c = obj_world(s, lc);
+      float r = hx + hy + hz;
+      if (fabsf(c.x - we->cx) > r + ext || fabsf(c.y - we->cy) > r + ext) continue;
+      box_welem(c, vscale(ax, hx), vscale(ay, hy), vscale(az, hz), &se);
+    }
+    int before = ncon;
+    collide_elems(we, &se);
+    /* faces against another part of the object are internal */
+    float zm = (fmaxf(we->z0, se.z0) + fminf(we->z1, se.z1)) * 0.5f;
+    for (int c = before; c < ncon; c++) {
+      vec3 q = obj_local(s, v3(con[c].px + con[c].nx * 0.02f, con[c].py + con[c].ny * 0.02f, zm));
+      if (!shape_solid_at(sh, q)) continue;
+      con[c] = con[ncon - 1];
+      ncon--;
+      c--;
+    }
+  }
+}
+
 /* dynamic element vs static object parts */
 static void collide_static(Body *bd, const WElem *we, int so) {
   Obj *s = &objs[so];
@@ -886,7 +977,10 @@ static void collide_static(Body *bd, const WElem *we, int so) {
   float hz = (we->z1 - we->z0) * 0.5f;
   /* in-plane check: static rotation must keep the xy plane */
   vec3 zl = qrot(inv, v3(0, 0, 1));
-  if (fabsf(zl.z) < 0.99f) return;
+  if (fabsf(zl.z) < 0.99f) {
+    collide_static_3d(we, so);
+    return;
+  }
   WElem le = *we;
   le.cx = cl.x;
   le.cy = cl.y;
@@ -948,25 +1042,28 @@ static void collide_static(Body *bd, const WElem *we, int so) {
           se.z1 = mxz;
           int before = ncon;
           collide_elems(&le, &se);
-          /* drop contacts whose normal points into a neighbouring collider (internal faces) */
+          /* faces shared with a neighbouring collider are internal: drop contacts pushing through them, and
+             at a corner where one of the two faces is internal, push along the other face only */
+          float qz = (fmaxf(le.z0, mnz) + fminf(le.z1, mxz)) * 0.5f;
           for (int c = before; c < ncon; c++) {
-            float nx = con[c].nx, ny = con[c].ny;
-            float qx = con[c].px + nx * 0.02f, qy = con[c].py + ny * 0.02f;
-            float qz = (fmaxf(le.z0, mnz) + fminf(le.z1, mxz)) * 0.5f;
-            int cx = (int)floorf(qx), cy = (int)floorf(qy), cz = (int)floorf(qz);
-            bool inside_other = false;
-            if (!(qx >= mnx && qx <= mxx && qy >= mny && qy <= mxy)) {
-              int pj = shape_find(sh, cx, cy, cz);
-              for (int j2 = pj; pj >= 0 && j2 < sh->np && (sh->key[j2] & ~7u) == (sh->key[pj] & ~7u); j2++) {
-                const Block *nb = blocks[sh->blk[j2]];
-                if ((nb->flags & 3) != 1) continue;
-                const uint8_t *nbb = nb->bb + PK_C(sh->key[j2]) * 6;
-                float vx = (qx - cx) * 8, vy = (qy - cy) * 8, vz = (qz - cz) * 8;
-                if (vx >= nbb[0] && vx <= nbb[3] + 1 && vy >= nbb[1] && vy <= nbb[4] + 1 && vz >= nbb[2] && vz <= nbb[5] + 1)
-                  inside_other = true;
+            Contact *k = &con[c];
+            float nx = k->nx, ny = k->ny, px = k->px, py = k->py;
+            bool drop = false;
+            if (fabsf(nx) < 0.02f || fabsf(ny) < 0.02f) {
+              drop = shape_solid_at(sh, v3(px + nx * 0.02f, py + ny * 0.02f, qz));
+            } else {
+              float sx = nx > 0 ? 1.0f : -1.0f, sy = ny > 0 ? 1.0f : -1.0f;
+              bool inx = shape_solid_at(sh, v3(px + sx * 0.02f, py, qz)), iny = shape_solid_at(sh, v3(px, py + sy * 0.02f, qz));
+              if (inx && iny) drop = true;
+              else if ((inx || iny) && le.circle) {
+                float r = le.hx, ccx = px + nx * (r - k->depth), ccy = py + ny * (r - k->depth);
+                float dep = iny ? r - (ccx - px) * sx : r - (ccy - py) * sy;
+                if (dep <= 0) drop = true;
+                else if (iny) k->nx = sx, k->ny = 0, k->py = ccy, k->depth = dep;
+                else k->nx = 0, k->ny = sy, k->px = ccx, k->depth = dep;
               }
             }
-            if (inside_other && fabsf(nx) + fabsf(ny) > 0) {
+            if (drop) {
               con[c] = con[ncon - 1];
               ncon--;
               c--;
@@ -1492,11 +1589,11 @@ void phys_debug(int frame) {
     }
     printf(" ncon=%d\n", ncon);
   }
-  if (getenv("ND_CON") && frame >= 90 && frame < 170) {
+  if (getenv("ND_CON") && frame >= atoi(getenv("ND_CON")) && frame < atoi(getenv("ND_CON")) + 80) {
     printf("f%d:", frame);
     for (int i = 0; i < ncon; i++) {
       Contact *c = &con[i];
-      printf(" b%d(%.2f,%.2f jn=%.2f jt=%.2f)", c->a, c->nx, c->ny, c->jn, c->jt);
+      printf(" b%d-s%d(%.2f,%.2f p=%.2f,%.2f jn=%.2f)", c->a, c->sobj, c->nx, c->ny, c->px, c->py, c->jn);
     }
     printf("\n");
   }

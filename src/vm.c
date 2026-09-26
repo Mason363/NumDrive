@@ -291,6 +291,14 @@ static quat look_rotation(vec3 fwd, vec3 up) {
 extern vec3 cam_world_to_screen(vec3 p);
 extern void cam_screen_to_world(float sx, float sy, vec3 *near, vec3 *far);
 
+#define RND_MEMO 8
+static struct {
+  const Env *e;
+  uint16_t node;
+  float v;
+} rnd_memo[RND_MEMO];
+static int nrnd;
+
 static void eval_node(Env *e, int ni, int out, Val *r) {
   const Prog *p = e->prog;
   const uint8_t *nd = node_ptr(p, ni);
@@ -406,9 +414,21 @@ static void eval_node(Env *e, int ni, int out, Val *r) {
       return;
     }
     case OP_RANDOM: {
+      /* a value block is worked out once per statement: every use shares the same number */
+      for (int i = 0; i < nrnd; i++)
+        if (rnd_memo[i].e == e && rnd_memo[i].node == ni) {
+          r->t = T_NUM;
+          r->u.f = rnd_memo[i].v;
+          return;
+        }
       float lo = in_num(e, nd, 0), hi = connected(nd, 1) ? in_num(e, nd, 1) : 1.0f;
       r->t = T_NUM;
       r->u.f = lo + (hi - lo) * rnd01();
+      if (nrnd < RND_MEMO) {
+        rnd_memo[nrnd].e = e;
+        rnd_memo[nrnd].node = (uint16_t)ni;
+        rnd_memo[nrnd++].v = r->u.f;
+      }
       return;
     }
     case OP_MODULO: {
@@ -476,8 +496,14 @@ static void eval_node(Env *e, int ni, int out, Val *r) {
       bool h = phys_raycast(from, to, &hit, &o);
 #ifdef HOST
       if (getenv("ND_RDBG") && vm_frame_count == atoi(getenv("ND_RDBG")))
+      {
         fprintf(stderr, "ray (%.2f %.2f %.2f)->(%.2f %.2f %.2f) hit=%d obj=%d at (%.2f %.2f %.2f)\n", from.x, from.y, from.z, to.x, to.y,
                 to.z, h, o, hit.x, hit.y, hit.z);
+        if (h) {
+          vec3 l = obj_local(&objs[o], from), l2 = obj_local(&objs[o], to);
+          fprintf(stderr, "   local (%.3f %.3f %.3f)->(%.3f %.3f %.3f) np=%d env anchor=%d\n", l.x, l.y, l.z, l2.x, l2.y, l2.z, objs[o].shape->np, e->anchor);
+        }
+      }
 #endif
       if (out == 0) {
         r->t = T_TRU;
@@ -594,6 +620,7 @@ static void set_slot(Env *e, int ni, int k, const Val *v) {
 }
 
 static void exec_stmt(Env *e, int ni) {
+  nrnd = 0;
   const Prog *p = e->prog;
   const uint8_t *nd = node_ptr(p, ni);
   int op = nd[0];
@@ -696,7 +723,12 @@ static void exec_stmt(Env *e, int ni) {
       }
       return;
     }
-    case OP_WIN: game_win(node_data(nd)[0]); return;
+    case OP_WIN:
+#ifdef HOST
+      if (getenv("ND_WDBG")) fprintf(stderr, "win at frame %d env %d node %d\n", vm_frame_count, (int)(e - envs), ni);
+#endif
+      game_win(node_data(nd)[0]);
+      return;
     case OP_LOSE: game_lose(node_data(nd)[0]); return;
     case OP_SET_SCORE: return;
     case OP_SET_CAMERA: {

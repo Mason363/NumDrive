@@ -66,8 +66,16 @@ void g_button(int x, int y, int w, int h, int r, uint16_t top, uint16_t bottom, 
 }
 
 const Glyph *font_glyph(const Font *f, int ch) {
-  for (int i = 0; i < f->n; i++)
-    if (f->g[i].code == ch) return &f->g[i];
+  /* glyphs are sorted by code; the small and medium fonts are a contiguous range */
+  int d = ch - f->g[0].code;
+  if (d >= 0 && d < f->n && f->g[d].code == ch) return &f->g[d];
+  int lo = 0, hi = f->n - 1;
+  while (lo <= hi) {
+    int m = (lo + hi) >> 1, c = f->g[m].code;
+    if (c == ch) return &f->g[m];
+    if (c < ch) lo = m + 1;
+    else hi = m - 1;
+  }
   return 0;
 }
 
