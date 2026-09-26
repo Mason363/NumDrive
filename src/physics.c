@@ -57,7 +57,8 @@ typedef struct {
 } Contact;
 
 typedef struct {
-  int a, b;              /* body indices (a = base, may be -1 = world), b = part */
+  int a, b;              /* body indices (a = base, -1 = static base object sobj), b = part */
+  int sobj;              /* static base object (moves with Set Position), -1 = none */
   vec3 la, lb;           /* anchors in rest frames (relative to com) */
   vec3 axx;              /* base frame x axis in the base rest frame */
   float ref;             /* reference relative angle */
@@ -141,16 +142,14 @@ static bool ray_part(const Shape *s, int pi, vec3 o, vec3 d, float *best) {
     }
     return hit;
   }
-  const uint8_t *bx = b->boxes;
-  for (int i = 0; i < b->nbox; i++, bx += 3) {
-    uint32_t w = bx[0] | bx[1] << 8 | (uint32_t)bx[2] << 16;
-    if ((int)(w & 7) != comp) continue;
-    vec3 mn = v3(cx + ((w >> 3) & 7) / 8.0f, cy + ((w >> 6) & 7) / 8.0f, cz + ((w >> 9) & 7) / 8.0f);
-    vec3 mx = v3(cx + (((w >> 12) & 7) + 1) / 8.0f, cy + (((w >> 15) & 7) + 1) / 8.0f, cz + (((w >> 18) & 7) + 1) / 8.0f);
-    if (ray_box(o, d, mn, mx, &t) && t < *best) {
-      *best = t;
-      hit = true;
-    }
+  /* Fancade box colliders are the bounds of the block's voxels */
+  const uint8_t *bb = b->bb + comp * 6;
+  if (bb[0] > bb[3]) return false;
+  vec3 mn = v3(cx + bb[0] / 8.0f, cy + bb[1] / 8.0f, cz + bb[2] / 8.0f);
+  vec3 mx = v3(cx + (bb[3] + 1) / 8.0f, cy + (bb[4] + 1) / 8.0f, cz + (bb[5] + 1) / 8.0f);
+  if (ray_box(o, d, mn, mx, &t) && t < *best) {
+    *best = t;
+    hit = true;
   }
   return hit;
 }
@@ -221,12 +220,12 @@ static bool ray_shape(const Shape *s, vec3 o, vec3 d, float *best) {
   return hit;
 }
 
-bool phys_raycast(vec3 from, vec3 to, vec3 *hit, int *obj) {
+bool phys_raycast_ex(vec3 from, vec3 to, vec3 *hit, int *obj, int ignore) {
   float best = 1.0f;
   int bo = -1;
   for (int i = 0; i < nobj; i++) {
     Obj *ob = &objs[i];
-    if (!(ob->flags & OF_COLLIDE) || (ob->flags & OF_DEAD)) continue;
+    if (!(ob->flags & OF_COLLIDE) || (ob->flags & OF_DEAD) || i == ignore) continue;
     vec3 o = obj_local(ob, from), t = obj_local(ob, to);
     float b = best;
     if (ray_shape(ob->shape, o, vsub(t, o), &b) && b < best) {
@@ -239,6 +238,8 @@ bool phys_raycast(vec3 from, vec3 to, vec3 *hit, int *obj) {
   *obj = bo;
   return true;
 }
+
+bool phys_raycast(vec3 from, vec3 to, vec3 *hit, int *obj) { return phys_raycast_ex(from, to, hit, obj, -1); }
 
 /* ----------------------------------------------------------------- bodies */
 static inline float cross2(float ax, float ay, float bx, float by) { return ax * by - ay * bx; }
@@ -279,8 +280,7 @@ static bool build_elems(Body *b) {
   int cap = 0;
   for (int i = 0; i < s->np; i++) {
     const Block *bk = blocks[s->blk[i]];
-    if ((bk->flags & 3) == 2) cap++;
-    else if (bk->flags & 3) cap += bk->nbox;
+    if (bk->flags & 3) cap++;
   }
   if (cap > 255) cap = 255;
   uint32_t mark = arena_mark();
@@ -307,22 +307,18 @@ static bool build_elems(Body *b) {
       e->z1 = c.z - s->com.z + rad;
       continue;
     }
-    const uint8_t *bx = bk->boxes;
-    for (int j = 0; j < bk->nbox && b->nel < cap; j++, bx += 3) {
-      uint32_t wv = bx[0] | bx[1] << 8 | (uint32_t)bx[2] << 16;
-      if ((int)(wv & 7) != comp) continue;
-      float mnx = PK_X(k) + ((wv >> 3) & 7) / 8.0f, mny = PK_Y(k) + ((wv >> 6) & 7) / 8.0f, mnz = PK_Z(k) + ((wv >> 9) & 7) / 8.0f;
-      float mxx = PK_X(k) + (((wv >> 12) & 7) + 1) / 8.0f, mxy = PK_Y(k) + (((wv >> 15) & 7) + 1) / 8.0f,
-            mxz = PK_Z(k) + (((wv >> 18) & 7) + 1) / 8.0f;
-      Elem *e = &b->el[b->nel++];
-      e->circle = 0;
-      e->cx = (mnx + mxx) * 0.5f - s->com.x;
-      e->cy = (mny + mxy) * 0.5f - s->com.y;
-      e->hx = (mxx - mnx) * 0.5f;
-      e->hy = (mxy - mny) * 0.5f;
-      e->z0 = mnz - s->com.z;
-      e->z1 = mxz - s->com.z;
-    }
+    const uint8_t *bb = bk->bb + comp * 6;
+    if (bb[0] > bb[3]) continue;
+    float mnx = PK_X(k) + bb[0] / 8.0f, mny = PK_Y(k) + bb[1] / 8.0f, mnz = PK_Z(k) + bb[2] / 8.0f;
+    float mxx = PK_X(k) + (bb[3] + 1) / 8.0f, mxy = PK_Y(k) + (bb[4] + 1) / 8.0f, mxz = PK_Z(k) + (bb[5] + 1) / 8.0f;
+    Elem *e = &b->el[b->nel++];
+    e->circle = 0;
+    e->cx = (mnx + mxx) * 0.5f - s->com.x;
+    e->cy = (mny + mxy) * 0.5f - s->com.y;
+    e->hx = (mxx - mnx) * 0.5f;
+    e->hy = (mxy - mny) * 0.5f;
+    e->z0 = mnz - s->com.z;
+    e->z1 = mxz - s->com.z;
   }
   /* merge boxes sharing an edge */
   for (int i = 0; i < b->nel; i++) {
@@ -433,6 +429,7 @@ static Body *body(int o) {
 }
 
 #ifdef HOST
+#include <stdio.h>
 #include <stdlib.h>
 static float k_fmul = 1.0f;
 static void host_tunables(void) {
@@ -482,8 +479,19 @@ void phys_get_velocity(int o, vec3 *vel, vec3 *spin) {
   *spin = v3(b->spin3.x, b->spin3.y, b->w * RAD2DEG);
 }
 
+/* like Fancade, physics blocks turn a plain object into a physics object */
+static Body *wake(int o) {
+  if (o >= 0 && o < nobj && !(objs[o].flags & (OF_DYNAMIC | OF_TEMPLATE | OF_DEAD))) {
+#ifdef HOST
+    if (getenv("ND_WAKE")) fprintf(stderr, "wake obj%d np=%d\n", o, objs[o].shape ? objs[o].shape->np : -1);
+#endif
+    phys_make_dynamic(o);
+  }
+  return body(o);
+}
+
 void phys_set_velocity(int o, const vec3 *vel, const vec3 *spin) {
-  Body *b = body(o);
+  Body *b = wake(o);
   if (!b) return;
   if (vel) {
     b->vx = vel->x;
@@ -497,7 +505,7 @@ void phys_set_velocity(int o, const vec3 *vel, const vec3 *spin) {
 }
 
 void phys_add_force(int o, const vec3 *f, const vec3 *at, const vec3 *t) {
-  Body *b = body(o);
+  Body *b = wake(o);
   if (!b) return;
   if (f) {
     b->fx += f->x;
@@ -511,7 +519,7 @@ void phys_set_locked(int o, const vec3 *p, const vec3 *r) {
   Obj *ob = &objs[o];
   if (p) ob->lockp = (p->x != 0 ? 1 : 0) | (p->y != 0 ? 2 : 0) | (p->z != 0 ? 4 : 0);
   if (r) ob->lockr = (r->x != 0 ? 1 : 0) | (r->y != 0 ? 2 : 0) | (r->z != 0 ? 4 : 0);
-  Body *b = body(o);
+  Body *b = wake(o);
   if (!b) return;
   b->lockx = (ob->lockp & 1) ? 1.0f : 0.0f;
   b->locky = (ob->lockp & 2) ? 1.0f : 0.0f;
@@ -523,7 +531,7 @@ void phys_set_locked(int o, const vec3 *p, const vec3 *r) {
 
 void phys_set_mass(int o, float m) {
   objs[o].mass = m;
-  Body *b = body(o);
+  Body *b = wake(o);
   if (b) body_mass(b);
 }
 void phys_set_friction(int o, float f) { objs[o].friction = f; }
@@ -552,23 +560,30 @@ int phys_add_constraint(int base, int part, vec3 pivot) {
     OOM("joints");
     return -1;
   }
+  /* like Fancade, a constraint needs a base object */
+  if (base < 0 || base >= nobj || part < 0 || part >= nobj || base == part) return -1;
   phys_make_dynamic(part);
   Body *pb = body(part);
   if (!pb) return -1;
-  Body *bb = base >= 0 ? body(base) : 0;
+  Body *bb = body(base);
   Joint *j = &joints[njoints];
   memset(j, 0, sizeof *j);
   j->b = (int)(pb - bodies);
   j->a = bb ? (int)(bb - bodies) : -1;
+  j->sobj = bb ? -1 : base;
   if (bb) {
     j->la = qrot(qconj(bb->rot), vsub(pivot, v3(bb->x, bb->y, bb->z)));
     j->axx = qrot(qconj(bb->rot), v3(1, 0, 0));
+    j->ref = pb->a - bb->a;
   } else {
-    j->la = pivot;
-    j->axx = v3(1, 0, 0);
+    /* static base: anchor kept in its rest frame so it follows the object when scripts move it */
+    Obj *so = &objs[base];
+    j->la = obj_local(so, pivot);
+    j->axx = qrot(qconj(so->rot), v3(1, 0, 0));
+    vec3 ax = qrot(so->rot, j->axx);
+    j->ref = pb->a - atan2f(ax.y, ax.x);
   }
   j->lb = qrot(qconj(pb->rot), vsub(pivot, v3(pb->x, pb->y, pb->z)));
-  j->ref = pb->a - (bb ? bb->a : 0);
   return njoints++;
 }
 
@@ -611,9 +626,9 @@ void phys_con_motor(int c, bool ang, vec3 v, vec3 f) {
     j->mf[2] = fabsf(f.z) * k_motor_scale;
   } else {
     j->mv[0] = v.x;
-    j->mf[0] = fabsf(f.x) * k_motor_scale;
+    j->mf[0] = fabsf(f.x);
     j->mv[1] = v.y;
-    j->mf[1] = fabsf(f.y) * k_motor_scale;
+    j->mf[1] = fabsf(f.y);
   }
 }
 
@@ -861,48 +876,44 @@ static void collide_static(Body *bd, const WElem *we, int so) {
             collide_elems(&le, &se);
             continue;
           }
-          const uint8_t *bx = bk->boxes;
-          for (int i = 0; i < bk->nbox; i++, bx += 3) {
-            uint32_t wv = bx[0] | bx[1] << 8 | (uint32_t)bx[2] << 16;
-            if ((int)(wv & 7) != comp) continue;
-            float mnx = x + ((wv >> 3) & 7) / 8.0f, mny = y + ((wv >> 6) & 7) / 8.0f, mnz = z + ((wv >> 9) & 7) / 8.0f;
-            float mxx = x + (((wv >> 12) & 7) + 1) / 8.0f, mxy = y + (((wv >> 15) & 7) + 1) / 8.0f,
-                  mxz = z + (((wv >> 18) & 7) + 1) / 8.0f;
-            se.circle = 0;
-            se.cx = (mnx + mxx) * 0.5f;
-            se.cy = (mny + mxy) * 0.5f;
-            se.ux = 1;
-            se.uy = 0;
-            se.hx = (mxx - mnx) * 0.5f;
-            se.hy = (mxy - mny) * 0.5f;
-            se.z0 = mnz;
-            se.z1 = mxz;
-            int before = ncon;
-            collide_elems(&le, &se);
-            /* drop contacts whose normal points into solid neighbouring voxels (internal faces) */
-            for (int c = before; c < ncon; c++) {
-              float nx = con[c].nx, ny = con[c].ny;
-              float qx = con[c].px + nx * 0.02f, qy = con[c].py + ny * 0.02f;
-              float qz = (fmaxf(le.z0, mnz) + fminf(le.z1, mxz)) * 0.5f;
-              /* point just outside the static surface */
-              int cx = (int)floorf(qx), cy = (int)floorf(qy), cz = (int)floorf(qz);
-              bool inside_other = false;
-              if (!(qx >= mnx && qx <= mxx && qy >= mny && qy <= mxy)) {
-                int pj = shape_find(sh, cx, cy, cz);
-                if (pj >= 0) {
-                  const Block *nb = blocks[sh->blk[pj]];
-                  int vx = (int)((qx - cx) * 8), vy = (int)((qy - cy) * 8), vz = (int)((qz - cz) * 8);
-                  if (vx > 7) vx = 7;
-                  if (vy > 7) vy = 7;
-                  if (vz > 7) vz = 7;
-                  if ((nb->flags & 3) == 1 && blk_solid(nb, vx, vy, vz)) inside_other = true;
-                }
+          /* Fancade box colliders are the bounds of the block's voxels */
+          const uint8_t *bbx = bk->bb + comp * 6;
+          if (bbx[0] > bbx[3]) continue;
+          float mnx = x + bbx[0] / 8.0f, mny = y + bbx[1] / 8.0f, mnz = z + bbx[2] / 8.0f;
+          float mxx = x + (bbx[3] + 1) / 8.0f, mxy = y + (bbx[4] + 1) / 8.0f, mxz = z + (bbx[5] + 1) / 8.0f;
+          se.circle = 0;
+          se.cx = (mnx + mxx) * 0.5f;
+          se.cy = (mny + mxy) * 0.5f;
+          se.ux = 1;
+          se.uy = 0;
+          se.hx = (mxx - mnx) * 0.5f;
+          se.hy = (mxy - mny) * 0.5f;
+          se.z0 = mnz;
+          se.z1 = mxz;
+          int before = ncon;
+          collide_elems(&le, &se);
+          /* drop contacts whose normal points into a neighbouring collider (internal faces) */
+          for (int c = before; c < ncon; c++) {
+            float nx = con[c].nx, ny = con[c].ny;
+            float qx = con[c].px + nx * 0.02f, qy = con[c].py + ny * 0.02f;
+            float qz = (fmaxf(le.z0, mnz) + fminf(le.z1, mxz)) * 0.5f;
+            int cx = (int)floorf(qx), cy = (int)floorf(qy), cz = (int)floorf(qz);
+            bool inside_other = false;
+            if (!(qx >= mnx && qx <= mxx && qy >= mny && qy <= mxy)) {
+              int pj = shape_find(sh, cx, cy, cz);
+              for (int j2 = pj; pj >= 0 && j2 < sh->np && (sh->key[j2] & ~7u) == (sh->key[pj] & ~7u); j2++) {
+                const Block *nb = blocks[sh->blk[j2]];
+                if ((nb->flags & 3) != 1) continue;
+                const uint8_t *nbb = nb->bb + PK_C(sh->key[j2]) * 6;
+                float vx = (qx - cx) * 8, vy = (qy - cy) * 8, vz = (qz - cz) * 8;
+                if (vx >= nbb[0] && vx <= nbb[3] + 1 && vy >= nbb[1] && vy <= nbb[4] + 1 && vz >= nbb[2] && vz <= nbb[5] + 1)
+                  inside_other = true;
               }
-              if (inside_other && fabsf(nx) + fabsf(ny) > 0) {
-                con[c] = con[ncon - 1];
-                ncon--;
-                c--;
-              }
+            }
+            if (inside_other && fabsf(nx) + fabsf(ny) > 0) {
+              con[c] = con[ncon - 1];
+              ncon--;
+              c--;
             }
           }
         }
@@ -1121,10 +1132,13 @@ static void joint_frame(Joint *j, Body **pa, Body **pb, float *rax, float *ray, 
     }
   } else {
     *rax = *ray = 0;
-    wax = j->la.x;
-    way = j->la.y;
-    cx = 1;
-    cy = 0;
+    const Obj *so = &objs[j->sobj];
+    vec3 w = obj_world(so, j->la), ax = qrot(so->rot, j->axx);
+    wax = w.x;
+    way = w.y;
+    float l = sqrtf(ax.x * ax.x + ax.y * ax.y);
+    cx = l > 1e-4f ? ax.x / l : 1;
+    cy = l > 1e-4f ? ax.y / l : 0;
   }
   rot2(B, j->lb, rbx, rby);
   float wbx = B->x + *rbx, wby = B->y + *rby;
@@ -1133,7 +1147,7 @@ static void joint_frame(Joint *j, Body **pa, Body **pb, float *rax, float *ray, 
   float dx = wbx - wax, dy = wby - way;
   *ex = dx * cx + dy * cy;
   *ey = -dx * cy + dy * cx;
-  *ang = B->a - (A ? A->a : 0) - j->ref;
+  *ang = B->a - (A ? A->a : atan2f(cy, cx)) - j->ref;
 }
 
 static void solve_joints(bool first) {
@@ -1181,7 +1195,14 @@ static void solve_joints(bool first) {
       /* spring: Bullet's 6DofSpring2 row, velocity target rv0 + f with the impulse clamped to f */
       if (j->spring[k] && (free_ || lo < hi)) {
         if (first) {
-          float fd = -j->c[k] * rv * DT, f = -j->k[k] * err[k] * DT + fd;
+          /* Bullet limits stiff springs to what the time step can sample, and over-damping */
+          float mr;
+          if (k < 2) mr = 1.0f / ((A ? A->invm : 0) + B->invm);
+          else mr = 1.0f / ((A ? A->invi * A->lockr : 0) + B->invi * B->lockr + 1e-9f);
+          float ks = j->k[k], kd = j->c[k];
+          if (0.25f < sqrtf(ks / mr) * DT) ks = mr / (DT * DT * 16.0f);
+          if (kd * DT > mr) kd = mr / DT;
+          float fd = -kd * rv * DT, f = -ks * err[k] * DT + fd;
           j->spt[k] = rv + f;
           j->splo[k] = fminf(fminf(f, fd), 0);
           j->sphi[k] = fmaxf(fmaxf(f, fd), 0);

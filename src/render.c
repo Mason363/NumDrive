@@ -1,10 +1,15 @@
 /* Strip-based z-buffered renderer for Fancade voxel objects (orthographic camera). */
 #include <string.h>
 #include <math.h>
+#ifdef HOST
+#include <stdio.h>
+#include <stdlib.h>
+#endif
 #include "render.h"
 #include "world.h"
 #include "platform.h"
 #include "vm.h"
+#include "physics.h"
 
 const uint8_t palette_rgb[34][3] = {
     {0, 0, 0}, {29, 29, 40}, {63, 63, 80}, {101, 103, 121}, {144, 147, 164}, {191, 194, 205}, {255, 255, 255},
@@ -415,8 +420,231 @@ static bool obj_screen_bounds(const Obj *o, int *y0, int *y1, int *x0, int *x1) 
 }
 
 
+/* ------------------------------------------------------------------ shadows */
+/* Moving objects (and the props following them, like the tyres) cast Fancade style shadows on the
+ * ground below: the box faces lit by the sun are projected along the light onto the plane found by a
+ * raycast, and ground pixels at that depth are darkened to their ambient only colour. */
+#define MAX_CASTERS 32
+#define SHADOW_TOL 40 /* depth units */
+static struct {
+  int16_t obj;
+  float ground;
+} casters[MAX_CASTERS];
+static int ncasters;
+static uint8_t smask[SCREEN_W * STRIP_H / 8];
+typedef struct {
+  float X, Y, ux, uy, vx, vy, z;
+  int16_t y0, y1;
+} SQuad;
+static SQuad *squads; /* projected shadow faces for this frame (scratch) */
+static int nsquads, squad_cap;
+static float sh_zx, sh_zy; /* screen depth gradient of a horizontal plane */
+static bool sh_any;
+
+static void find_casters(void) {
+  ncasters = 0;
+  vec3 d = vscale(light_to, -1);
+  if (d.y > -0.05f) return;
+  vec3 n = v3(0, 1, 0);
+  float nf = vdot(n, cam.fwd);
+  if (fabsf(nf) < 1e-4f) return;
+  sh_zx = -vdot(n, cam.right) / (cam.scale * nf);
+  sh_zy = vdot(n, cam.up) / (cam.scale * nf);
+  /* dynamic objects first, then small moved props close to them */
+  int ndyn = 0;
+  for (int pass = 0; pass < 2; pass++, ndyn = ncasters)
+    for (int i = 0; i < nobj && ncasters < MAX_CASTERS; i++) {
+      const Obj *o = &objs[i];
+      if (!(o->flags & OF_VISIBLE) || (o->flags & (OF_DEAD | OF_TEMPLATE)) || robj[i].ymin > robj[i].ymax) continue;
+      if (pass == 0 && !(o->flags & OF_DYNAMIC)) continue;
+      if (pass == 1) {
+        if ((o->flags & OF_DYNAMIC) || !(o->flags & OF_MOVED) || o->shape->np > 48) continue;
+        bool near = false;
+        for (int c = 0; c < ndyn && !near; c++) {
+          const Obj *q = &objs[casters[c].obj];
+          float dx = q->pos.x - o->pos.x, dy = q->pos.y - o->pos.y;
+          near = dx * dx + dy * dy < 9;
+        }
+        if (!near) continue;
+      }
+      const Shape *s = o->shape;
+      vec3 from = obj_world(o, vscale(vadd(s->bmin, s->bmax), 0.5f)), hit;
+      int ho;
+      if (!phys_raycast_ex(from, v3(from.x, from.y - 12, from.z), &hit, &ho, i)) continue;
+      casters[ncasters].obj = (int16_t)i;
+      casters[ncasters].ground = hit.y;
+      ncasters++;
+    }
+}
+
+/* mark pixels of the parallelogram whose stored depth matches the plane */
+static void raster_mark(float X0, float Y0, float ux, float uy, float vx, float vy, float z0) {
+  float det = ux * vy - uy * vx;
+  if (fabsf(det) < 1e-3f) return;
+  float id = 1.0f / det;
+  PInv pv;
+  pv.dsdx = vy * id;
+  pv.dsdy = -vx * id;
+  pv.dtdx = -uy * id;
+  pv.dtdy = ux * id;
+  pv.isx = fabsf(pv.dsdx) > 1e-6f ? 1.0f / pv.dsdx : 0;
+  pv.itx = fabsf(pv.dtdx) > 1e-6f ? 1.0f / pv.dtdx : 0;
+  const PInv *pi = &pv;
+  float ymin = Y0, ymax = Y0;
+  float ya = Y0 + uy, yb = Y0 + vy, yc2 = Y0 + uy + vy;
+  if (ya < ymin) ymin = ya;
+  if (ya > ymax) ymax = ya;
+  if (yb < ymin) ymin = yb;
+  if (yb > ymax) ymax = yb;
+  if (yc2 < ymin) ymin = yc2;
+  if (yc2 > ymax) ymax = yc2;
+  int y0 = iceil(ymin - 0.5f), y1 = iceil(ymax - 0.5f);
+  if (y0 < strip_y0) y0 = strip_y0;
+  if (y1 > strip_y1) y1 = strip_y1;
+  if (y0 >= y1) return;
+  float zbase = (z0 + ZOFF - sh_zx * X0 - sh_zy * Y0) * ZSCALE;
+  float dy = y0 + 0.5f - Y0;
+  float sr = pi->dsdy * dy, tr = pi->dtdy * dy;
+  for (int y = y0; y < y1; y++, sr += pi->dsdy, tr += pi->dtdy) {
+    float xl, xr;
+    if (pi->isx != 0) {
+      float a = -sr * pi->isx, b = (1 - sr) * pi->isx;
+      if (a < b) xl = a, xr = b;
+      else xl = b, xr = a;
+    } else {
+      if (sr < 0 || sr >= 1) continue;
+      xl = -1e9f, xr = 1e9f;
+    }
+    if (pi->itx != 0) {
+      float a = -tr * pi->itx, b = (1 - tr) * pi->itx;
+      if (a > b) {
+        float t = a;
+        a = b;
+        b = t;
+      }
+      if (a > xl) xl = a;
+      if (b < xr) xr = b;
+    } else if (tr < 0 || tr >= 1) {
+      continue;
+    }
+    if (xl >= xr) continue;
+    int x0 = iceil(X0 + xl - 0.5f), x1 = iceil(X0 + xr - 0.5f);
+    if (x0 < clip_x0) x0 = clip_x0;
+    if (x1 > clip_x1) x1 = clip_x1;
+    if (x0 >= x1) continue;
+    float zs = zbase + (sh_zx * (x0 + 0.5f) + sh_zy * (y + 0.5f)) * ZSCALE;
+    float dz = sh_zx * ZSCALE;
+    int row = (y - strip_y0) * SCREEN_W;
+    const uint16_t *zp = zbuf + row;
+    for (int x = x0; x < x1; x++, zs += dz) {
+      int d = (int)zs - zp[x];
+      if (d <= SHADOW_TOL && d >= -SHADOW_TOL) smask[(row + x) >> 3] |= (uint8_t)(1 << ((row + x) & 7));
+    }
+    sh_any = true;
+  }
+}
+
+/* project a lit face (corner p, edges u, v in world space) onto the plane y = g */
+static void shadow_face(vec3 p, vec3 u, vec3 v, float g, vec3 d) {
+  float k = (g - p.y) / d.y;
+  if (k < 0 || nsquads >= squad_cap) return; /* face below the ground plane */
+  vec3 p0 = vadd(p, vscale(d, k));
+  vec3 u0 = vsub(u, vscale(d, u.y / d.y)), v0 = vsub(v, vscale(d, v.y / d.y));
+  vec3 q = vsub(p0, vadd(cam.focus, cam.shake));
+  SQuad *sq = &squads[nsquads];
+  sq->X = cam.cx + vdot(q, cam.right) * cam.scale;
+  sq->Y = cam.cy - vdot(q, cam.up) * cam.scale;
+  sq->z = vdot(q, cam.fwd) - 0.01f;
+  sq->ux = vdot(u0, cam.right) * cam.scale;
+  sq->uy = -vdot(u0, cam.up) * cam.scale;
+  sq->vx = vdot(v0, cam.right) * cam.scale;
+  sq->vy = -vdot(v0, cam.up) * cam.scale;
+  float ymin = sq->Y + fminf(0, sq->uy) + fminf(0, sq->vy), ymax = sq->Y + fmaxf(0, sq->uy) + fmaxf(0, sq->vy);
+  if (ymax < 0 || ymin > SCREEN_H) return;
+  sq->y0 = (int16_t)(ymin - 1);
+  sq->y1 = (int16_t)(ymax + 1);
+  nsquads++;
+}
+
+/* project the shadows of all casters once per frame */
+static void build_shadows(void) {
+  nsquads = 0;
+  if (!ncasters) return;
+  vec3 d = vscale(light_to, -1);
+  for (int c = 0; c < ncasters; c++) {
+    const Obj *o = &objs[casters[c].obj];
+    const Shape *s = o->shape;
+    float g = casters[c].ground;
+    vec3 ax[3] = {qrot(o->rot, v3(1, 0, 0)), qrot(o->rot, v3(0, 1, 0)), qrot(o->rot, v3(0, 0, 1))};
+    bool lit[6];
+    for (int f = 0; f < 6; f++) lit[f] = vdot(ax[f >> 1], light_to) * ((f & 1) ? -1.0f : 1.0f) > 1e-3f;
+    for (int i = 0; i < s->np; i++) {
+      uint32_t k = s->key[i];
+      const Block *b = blocks[s->blk[i]];
+      int comp = PK_C(k);
+      /* use the collision boxes, or the component bounds when the block has none */
+      int nb = b->nbox;
+      for (int j = 0; j < (nb ? nb : 1); j++) {
+        float lo[3], hi[3];
+        if (nb) {
+          const uint8_t *bx = b->boxes + 3 * j;
+          uint32_t w = bx[0] | bx[1] << 8 | (uint32_t)bx[2] << 16;
+          if ((int)(w & 7) != comp) continue;
+          lo[0] = ((w >> 3) & 7), lo[1] = ((w >> 6) & 7), lo[2] = ((w >> 9) & 7);
+          hi[0] = ((w >> 12) & 7) + 1, hi[1] = ((w >> 15) & 7) + 1, hi[2] = ((w >> 18) & 7) + 1;
+        } else {
+          const uint8_t *bb = b->bb + comp * 6;
+          if (bb[0] > bb[3]) continue;
+          lo[0] = bb[0], lo[1] = bb[1], lo[2] = bb[2];
+          hi[0] = bb[3] + 1, hi[1] = bb[4] + 1, hi[2] = bb[5] + 1;
+        }
+        vec3 rest = v3(PK_X(k) + lo[0] / 8, PK_Y(k) + lo[1] / 8, PK_Z(k) + lo[2] / 8);
+        vec3 p0 = obj_world(o, rest);
+        vec3 e[3] = {vscale(ax[0], (hi[0] - lo[0]) / 8), vscale(ax[1], (hi[1] - lo[1]) / 8),
+                     vscale(ax[2], (hi[2] - lo[2]) / 8)};
+        for (int f = 0; f < 6; f++) {
+          if (!lit[f]) continue;
+          int a = f >> 1, ua = a == 0 ? 1 : 0, va = a == 2 ? 1 : 2;
+          vec3 p = (f & 1) ? p0 : vadd(p0, e[a]);
+          shadow_face(p, e[ua], e[va], g, d);
+        }
+      }
+    }
+  }
+}
+
+static void draw_shadows(void) {
+  if (!nsquads) return;
+  memset(smask, 0, sizeof smask);
+  sh_any = false;
+  for (int i = 0; i < nsquads; i++) {
+    const SQuad *q = &squads[i];
+    if (q->y1 < strip_y0 || q->y0 >= strip_y1) continue;
+    raster_mark(q->X, q->Y, q->ux, q->uy, q->vx, q->vy, q->z);
+  }
+  if (!sh_any) return;
+  int n = (strip_y1 - strip_y0) * SCREEN_W;
+  for (int i = 0; i < n; i += 8) {
+    uint8_t m = smask[i >> 3];
+    if (!m) continue;
+    for (int k = 0; k < 8; k++)
+      if (m & (1 << k)) {
+        uint16_t c = cbuf[i + k];
+        int r = (c >> 11) * 23 >> 5, gg = ((c >> 5) & 63) * 23 >> 5, bl = (c & 31) * 26 >> 5;
+        cbuf[i + k] = (uint16_t)(r << 11 | gg << 5 | bl);
+      }
+  }
+}
+
 void render_prepare(int rx0, int rx1) {
-  pc_base = arena_top(&pc_avail);
+  uint32_t avail;
+  uint8_t *scr = arena_top(&avail);
+  squads = (SQuad *)scr;
+  squad_cap = (int)((avail / 3) / sizeof(SQuad)); /* at most a third of the free space */
+  if (squad_cap > 512) squad_cap = 512;
+  uint32_t used = (uint32_t)squad_cap * sizeof(SQuad);
+  pc_base = scr + used;
+  pc_avail = avail - used;
   pc_used = 0;
   for (int i = 0; i < nobj; i++) {
     Obj *o = &objs[i];
@@ -431,6 +659,8 @@ void render_prepare(int rx0, int rx1) {
     r->ymin = (int16_t)(y0 < -32000 ? -32000 : y0);
     r->ymax = (int16_t)(y1 > 32000 ? 32000 : y1);
   }
+  find_casters();
+  build_shadows();
 }
 
 uint16_t *render_buffer(void) { return cbuf; }
@@ -453,6 +683,7 @@ uint16_t *render_strip(int sy, int n, int x0, int x1) {
     if (r->ymin > r->ymax || r->ymax < strip_y0 || r->ymin >= strip_y1) continue;
     draw_object(&objs[i], r);
   }
+  draw_shadows();
   return cbuf;
 }
 

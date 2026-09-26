@@ -1,5 +1,8 @@
 #include <stdlib.h>
 #include <string.h>
+#ifdef HOST
+#include <stdio.h>
+#endif
 #include "platform.h"
 #include "world.h"
 #include "vm.h"
@@ -47,6 +50,17 @@ static bool start_level(int i) {
 static void sim_step(uint8_t buttons) {
   vm_buttons = buttons;
   vm_frame();
+#ifdef HOST
+  if (getenv("ND_ODBG") && vm_frame_count <= 1) {
+    const char *l = getenv("ND_ODBG");
+    while (*l) {
+      int o = atoi(l);
+      if (o >= 0 && o < nobj) fprintf(stderr, "f%d obj%d pos=(%.2f %.2f %.2f) flags=%x\n", vm_frame_count, o, objs[o].pos.x, objs[o].pos.y, objs[o].pos.z, objs[o].flags);
+      while (*l && *l != ',') l++;
+      if (*l) l++;
+    }
+  }
+#endif
   phys_step();
 #ifdef HOST
   {

@@ -1,5 +1,9 @@
 /* Fancade script interpreter. */
 #include <string.h>
+#ifdef HOST
+#include <stdio.h>
+#include <stdlib.h>
+#endif
 #include "vm.h"
 #include "world.h"
 #include "physics.h"
@@ -32,6 +36,7 @@ typedef struct {
 struct Env {
   Prog *prog;
   uint16_t parent, pnode;
+  uint16_t nsub; /* environments in this subtree, itself included */
   int16_t bx, by, bz;
   int16_t anchor;
   uint16_t tbase;
@@ -469,6 +474,11 @@ static void eval_node(Env *e, int ni, int out, Val *r) {
       vec3 from = in_vec(e, nd, 0), to = in_vec(e, nd, 1), hit;
       int o = -1;
       bool h = phys_raycast(from, to, &hit, &o);
+#ifdef HOST
+      if (getenv("ND_RDBG") && vm_frame_count < 1)
+        fprintf(stderr, "ray (%.2f %.2f %.2f)->(%.2f %.2f %.2f) hit=%d obj=%d at (%.2f %.2f %.2f)\n", from.x, from.y, from.z, to.x, to.y,
+                to.z, h, o, hit.x, hit.y, hit.z);
+#endif
       if (out == 0) {
         r->t = T_TRU;
         r->u.i = h;
@@ -802,6 +812,12 @@ static void exec_stmt(Env *e, int ni) {
       memset(&v, 0, sizeof v);
       v.t = T_CON;
       v.u.i = obj_valid(part) ? phys_add_constraint(obj_valid(base) ? base : -1, part, pivot) : -1;
+#ifdef HOST
+      if (getenv("ND_CDBG"))
+        fprintf(stderr, "constraint base=%d part=%d pivot=(%.2f %.2f %.2f) partpos=(%.2f %.2f %.2f)\n", base, part, pivot.x, pivot.y,
+                pivot.z, obj_valid(part) ? objs[part].pos.x : 0, obj_valid(part) ? objs[part].pos.y : 0,
+                obj_valid(part) ? objs[part].pos.z : 0);
+#endif
       set_slot(e, ni, 0, &v);
       return;
     }
@@ -906,6 +922,7 @@ static bool make_env(Prog *p, int parent, int pnode, int bx, int by, int bz) {
     const uint8_t *nd = node_ptr(p, i);
     if (!make_env(ch, idx, i, rd16(nd + 3), rd16(nd + 5), rd16(nd + 7))) return false;
   }
+  envs[idx].nsub = (uint16_t)(nenvs - idx);
   return true;
 }
 
@@ -926,14 +943,36 @@ bool vm_setup_envs(void) {
   return make_env(level.prog, -1, NONE16, 0, 0, 0);
 }
 
+/* Fancade runs the script chains of a program and the custom script blocks placed in it
+ * interleaved, in block order (nodes are sorted that way); child environments follow their
+ * parent in node order, each followed by its own subtree */
+static void run_env(int ei) {
+  Env *e = &envs[ei];
+  const Prog *p = e->prog;
+  int child = ei + 1, k = 0;
+  for (int i = 0; i < p->nnodes; i++) {
+    const uint8_t *nd = node_ptr(p, i);
+    if (nd[0] == OP_CUSTOM) {
+      if (child < nenvs && envs[child].parent == ei && envs[child].pnode == i) {
+        int n = envs[child].nsub;
+        run_env(child);
+        child += n;
+      }
+      continue;
+    }
+    for (int j = k; j < p->nentries; j++)
+      if (rd16(p->entries + 2 * j) == i) {
+        run_chain(e, (uint16_t)i);
+        if (j == k) k++;
+        break;
+      }
+  }
+}
+
 void vm_frame(void) {
   button_counter = 0;
   nlate = 0;
-  for (int i = 0; i < nenvs; i++) {
-    Env *e = &envs[i];
-    const Prog *p = e->prog;
-    for (int k = 0; k < p->nentries; k++) run_chain(e, rd16(p->entries + 2 * k));
-  }
+  if (nenvs) run_env(0);
 }
 
 void vm_late(void) {

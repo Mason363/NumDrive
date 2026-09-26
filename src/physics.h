@@ -10,6 +10,7 @@ void phys_step(void);
 void phys_start(void); /* after scripts' first frame: create bodies for physics objects */
 
 bool phys_raycast(vec3 from, vec3 to, vec3 *hit, int *obj);
+bool phys_raycast_ex(vec3 from, vec3 to, vec3 *hit, int *obj, int ignore);
 void phys_get_velocity(int o, vec3 *vel, vec3 *spin);
 void phys_set_velocity(int o, const vec3 *vel, const vec3 *spin);
 void phys_add_force(int o, const vec3 *force, const vec3 *at, const vec3 *torque);
