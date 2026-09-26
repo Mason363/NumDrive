@@ -828,6 +828,9 @@ static void exec_stmt(Env *e, int ni) {
       if (!obj_valid(o)) return;
       if (connected(nd, 1)) objs[o].pos = in_vec(e, nd, 1);
       if (connected(nd, 2)) objs[o].rot = qnorm(in_rot(e, nd, 2));
+#ifdef HOST
+      if (getenv("ND_PDBG")) fprintf(stderr, "f%d setpos obj%d (%.3f %.3f %.3f) rot(%.3f %.3f %.3f %.3f)%s\n", vm_frame_count, o, objs[o].pos.x, objs[o].pos.y, objs[o].pos.z, objs[o].rot.x, objs[o].rot.y, objs[o].rot.z, objs[o].rot.w, connected(nd, 2) ? " +rot" : "");
+#endif
       objs[o].flags |= OF_MOVED;
       phys_moved(o);
       return;
