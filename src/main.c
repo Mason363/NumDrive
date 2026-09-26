@@ -58,7 +58,7 @@ static void sim_step(uint8_t buttons) {
     const char *l = getenv("ND_ODBG");
     while (*l) {
       int o = atoi(l);
-      if (o >= 0 && o < nobj) fprintf(stderr, "f%d obj%d pos=(%.2f %.2f %.2f) flags=%x\n", vm_frame_count, o, objs[o].pos.x, objs[o].pos.y, objs[o].pos.z, objs[o].flags);
+      if (o >= 0 && o < nobj) fprintf(stderr, "f%d obj%d pos=(%.2f %.2f %.2f) rot=(%.3f %.3f %.3f %.3f) flags=%x\n", vm_frame_count, o, objs[o].pos.x, objs[o].pos.y, objs[o].pos.z, objs[o].rot.x, objs[o].rot.y, objs[o].rot.z, objs[o].rot.w, objs[o].flags);
       while (*l && *l != ',') l++;
       if (*l) l++;
     }

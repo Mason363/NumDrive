@@ -579,6 +579,9 @@ void phys_set_velocity(int o, const vec3 *vel, const vec3 *spin) {
 
 void phys_add_force(int o, const vec3 *f, const vec3 *at, const vec3 *t) {
   Body *b = wake(o);
+#ifdef HOST
+  if (getenv("ND_FDBG")) fprintf(stderr, "force obj%d b=%d f=%s(%.2f,%.2f,%.2f) at=%s(%.2f,%.2f,%.2f) t=%s\n", o, b ? (int)(b - bodies) : -1, f ? "" : "-", f ? f->x : 0, f ? f->y : 0, f ? f->z : 0, at ? "" : "-", at ? at->x : 0, at ? at->y : 0, at ? at->z : 0, t ? "y" : "-");
+#endif
   if (!b) return;
   if (f) {
     b->fx += f->x;
@@ -1131,7 +1134,10 @@ static void collide_static(Body *bd, const WElem *we, int so) {
             float nx = k->nx, ny = k->ny, px = k->px, py = k->py;
             bool drop = false;
             if (fabsf(nx) < 0.02f || fabsf(ny) < 0.02f) {
-              drop = shape_solid_at(sh, v3(px + nx * 0.02f, py + ny * 0.02f, qz));
+              /* the point is on the body: sample the neighbour just past the collider's face, level with
+                 the collider (never on its edges) */
+              if (fabsf(nx) < 0.02f) drop = shape_solid_at(sh, v3(fminf(fmaxf(px, mnx + 0.02f), mxx - 0.02f), (ny > 0 ? mxy : mny) + ny * 0.02f, qz));
+              else drop = shape_solid_at(sh, v3((nx > 0 ? mxx : mnx) + nx * 0.02f, fminf(fmaxf(py, mny + 0.02f), mxy - 0.02f), qz));
             } else {
               float sx = nx > 0 ? 1.0f : -1.0f, sy = ny > 0 ? 1.0f : -1.0f;
               bool inx = shape_solid_at(sh, v3(px + sx * 0.02f, py, qz)), iny = shape_solid_at(sh, v3(px, py + sy * 0.02f, qz));
@@ -1849,6 +1855,7 @@ void phys_debug(int frame) {
     JointExt z = {{0}}, *x = jt->ext ? jt->ext : &z;
     printf("  j%d a=%d b=%d lo=(%.2f,%.2f,%.2f) hi=(%.2f,%.2f,%.2f) k=(%.1f,%.1f,%.1f) c=%.1f mv=%.2f mf=%.2f\n", j, jt->a, jt->b, jt->lo[0],
            jt->lo[1], jt->lo[2], jt->hi[0], jt->hi[1], jt->hi[2], x->k[0], x->k[1], x->k[2], x->c[1], x->mv[2], x->mf[2]);
+    if (frame == 0) printf("    la=(%.3f,%.3f,%.3f) lb=(%.3f,%.3f,%.3f)\n", jt->la.x, jt->la.y, jt->la.z, jt->lb.x, jt->lb.y, jt->lb.z);
   }
 }
 #endif

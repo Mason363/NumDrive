@@ -713,7 +713,7 @@ bool world_load_level(int index) {
             const Block *b = blocks[sh->blk[j]];
             int c = PK_C(sh->key[j]);
             const uint8_t *bb = b->bb + c * 6;
-            fprintf(stderr, "  part cell(%d,%d,%d) comp %d coll %d cnt %d bb[%d-%d,%d-%d,%d-%d]\n", PK_X(sh->key[j]), PK_Y(sh->key[j]), PK_Z(sh->key[j]), c,
+            fprintf(stderr, "  part blk%d fl%x cell(%d,%d,%d) comp %d coll %d cnt %d bb[%d-%d,%d-%d,%d-%d]\n", sh->blk[j], b->flags, PK_X(sh->key[j]), PK_Y(sh->key[j]), PK_Z(sh->key[j]), c,
                     b->flags & 3, (int)b->cnt[c], bb[0], bb[3], bb[1], bb[4], bb[2], bb[5]);
           }
       }
