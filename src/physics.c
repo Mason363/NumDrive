@@ -387,12 +387,14 @@ static void body_mass(Body *b) {
   for (int i = 0; i < s->np; i++) {
     const Block *bk = blocks[s->blk[i]];
     int comp = PK_C(s->key[i]);
-    float cx = PK_X(s->key[i]) - s->com.x, cy = PK_Y(s->key[i]) - s->com.y;
+    float cx = PK_X(s->key[i]) - s->com.x, cy = PK_Y(s->key[i]) - s->com.y, cz = PK_Z(s->key[i]) - s->com.z;
     for (int z = 0; z < 8; z++)
       for (int y = 0; y < 8; y++)
         for (int x = 0; x < 8; x++) {
           if (!blk_solid(bk, x, y, z) || blk_comp(bk, x, y, z) != comp) continue;
-          float dx = cx + (x + 0.5f) / 8, dy = cy + (y + 0.5f) / 8;
+          /* about the world z axis: the body may be turned about x or y */
+          float lx = cx + (x + 0.5f) / 8, ly = cy + (y + 0.5f) / 8, lz = cz + (z + 0.5f) / 8;
+          float dx = b->m00 * lx + b->m01 * ly + b->m02 * lz, dy = b->m10 * lx + b->m11 * ly + b->m12 * lz;
           I += dx * dx + dy * dy + 1.0f / 384.0f;
           m += 1;
         }
@@ -401,7 +403,6 @@ static void body_mass(Body *b) {
     I = 1;
     m = 1;
   }
-  /* rotate com into base frame does not change inertia about z */
   b->inertia = I / m * b->mass;
   if (s->sphere) b->inertia = 0.4f * b->mass * s->radius * s->radius;
   if (b->inertia < 1e-4f) b->inertia = 1e-4f;
@@ -563,7 +564,14 @@ void phys_set_gravity(vec3 g) { phys_gravity = g; }
 
 void phys_moved(int o) {
   Body *b = body(o);
-  if (b) sync_body(b);
+  if (!b) return;
+  float m02 = b->m02, m12 = b->m12, m20 = b->m20, m21 = b->m21;
+  sync_body(b);
+  /* turned about x or y: the inertia about the plane normal changes */
+  if (fabsf(m02 - b->m02) + fabsf(m12 - b->m12) + fabsf(m20 - b->m20) + fabsf(m21 - b->m21) > 1e-3f) {
+    body_mass(b);
+    body_zrange(b);
+  }
 }
 
 /* hiding an object takes it out of the physics world, which drops its constraints */
@@ -993,12 +1001,34 @@ static float mix_friction(float a, float b) {
   return f > 10 ? 10 : f;
 }
 
+/* is the world point inside a box collider of a static object other than skip? */
+static bool static_solid_at(vec3 w, int skip) {
+  for (int s = 0; s < nobj; s++) {
+    const Obj *os = &objs[s];
+    if (s == skip || (os->flags & (OF_DYNAMIC | OF_DEAD | OF_TEMPLATE | OF_COLLIDE | OF_VISIBLE)) != (OF_COLLIDE | OF_VISIBLE)) continue;
+    const Shape *sh = os->shape;
+    vec3 l = obj_local(os, w);
+    if (l.x < sh->bmin.x || l.y < sh->bmin.y || l.z < sh->bmin.z || l.x > sh->bmax.x || l.y > sh->bmax.y || l.z > sh->bmax.z) continue;
+    int cx = (int)floorf(l.x), cy = (int)floorf(l.y), cz = (int)floorf(l.z);
+    int pj = shape_find(sh, cx, cy, cz);
+    for (int j = pj; pj >= 0 && j < sh->np && (sh->key[j] & ~7u) == (sh->key[pj] & ~7u); j++) {
+      const Block *nb = blocks[sh->blk[j]];
+      if ((nb->flags & 3) != 1) continue;
+      const uint8_t *bb = nb->bb + PK_C(sh->key[j]) * 6;
+      float vx = (l.x - cx) * 8, vy = (l.y - cy) * 8, vz = (l.z - cz) * 8;
+      if (vx >= bb[0] && vx <= bb[3] + 1 && vy >= bb[1] && vy <= bb[4] + 1 && vz >= bb[2] && vz <= bb[5] + 1) return true;
+    }
+  }
+  return false;
+}
+
 static void gen_contacts(void) {
   ncon = 0;
   for (int i = 0; i < nbodies; i++) {
     Body *A = &bodies[i];
     if (A->obj < 0 || (objs[A->obj].flags & (OF_COLLIDE | OF_VISIBLE)) != (OF_COLLIDE | OF_VISIBLE)) continue;
     Obj *oa = &objs[A->obj];
+    int first = ncon;
     WElem wa[MAX_ELEMS];
     int na = A->nel < MAX_ELEMS ? A->nel : MAX_ELEMS;
     for (int e = 0; e < na; e++) elem_world(A, &A->el[e], &wa[e]);
@@ -1020,6 +1050,14 @@ static void gen_contacts(void) {
       cur_mu = mix_friction(oa->friction, os->friction);
       cur_rest = oa->bounce * os->bounce;
       for (int e = 0; e < na; e++) collide_static(A, &wa[e], s);
+    }
+    /* faces buried in another static object (overlapping track pieces) are internal too */
+    for (int c = first; c < ncon; c++) {
+      float zc = (A->zmin + A->zmax) * 0.5f;
+      if (!static_solid_at(v3(con[c].px + con[c].nx * 0.02f, con[c].py + con[c].ny * 0.02f, zc), con[c].sobj)) continue;
+      con[c] = con[ncon - 1];
+      ncon--;
+      c--;
     }
     /* Fancade's floor: an endless plane at y = 0 */
     if (A->y - A->bound < 0) {
