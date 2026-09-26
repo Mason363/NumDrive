@@ -25,6 +25,9 @@ void game_win(int delay) {
   if (win_timer < 0 && lose_timer < 0) win_timer = delay > SHOT_FRAMES ? delay : SHOT_FRAMES;
 }
 void game_lose(int delay) {
+#ifdef HOST
+  if (getenv("ND_WDBG") && win_timer < 0 && lose_timer < 0) fprintf(stderr, "lose at frame %d\n", vm_frame_count);
+#endif
   if (win_timer < 0 && lose_timer < 0) lose_timer = delay > SHOT_FRAMES ? delay : SHOT_FRAMES;
 }
 

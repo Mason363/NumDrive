@@ -9,6 +9,7 @@
 #include "physics.h"
 #include "ops.h"
 #include "platform.h"
+#include "ui.h"
 
 typedef struct {
   uint8_t type;
@@ -498,10 +499,21 @@ static void eval_node(Env *e, int ni, int out, Val *r) {
       int o = -1;
       bool h = phys_raycast(from, to, &hit, &o);
 #ifdef HOST
-      if (getenv("ND_RDBG") && vm_frame_count == atoi(getenv("ND_RDBG")))
+      if (getenv("ND_RDBG") && (vm_frame_count == atoi(getenv("ND_RDBG")) || atoi(getenv("ND_RDBG")) < 0))
       {
         fprintf(stderr, "ray (%.2f %.2f %.2f)->(%.2f %.2f %.2f) hit=%d obj=%d at (%.2f %.2f %.2f)\n", from.x, from.y, from.z, to.x, to.y,
                 to.z, h, o, hit.x, hit.y, hit.z);
+        if (getenv("ND_RDBG2") && fabsf(from.x - atof(getenv("ND_RDBG2"))) < 0.01f)
+          for (int q = 0; q < nobj; q++) {
+            vec3 l = obj_local(&objs[q], from), l2 = obj_local(&objs[q], to);
+            const Shape *sh = objs[q].shape;
+            float ax = l.x < l2.x ? l.x : l2.x, bx = l.x < l2.x ? l2.x : l.x;
+            float ay = l.y < l2.y ? l.y : l2.y, by = l.y < l2.y ? l2.y : l.y;
+            float az = l.z < l2.z ? l.z : l2.z, bz = l.z < l2.z ? l2.z : l.z;
+            if (bx < sh->bmin.x || ax > sh->bmax.x || by < sh->bmin.y || ay > sh->bmax.y || bz < sh->bmin.z || az > sh->bmax.z) continue;
+            fprintf(stderr, "   f%d cand obj %d flags %x local (%.3f %.3f %.3f)->(%.3f %.3f %.3f) bounds (%.2f %.2f %.2f)-(%.2f %.2f %.2f) np=%d\n", vm_frame_count, q, objs[q].flags, l.x, l.y, l.z, l2.x, l2.y, l2.z,
+                    sh->bmin.x, sh->bmin.y, sh->bmin.z, sh->bmax.x, sh->bmax.y, sh->bmax.z, sh->np);
+          }
         if (h) {
           vec3 l = obj_local(&objs[o], from), l2 = obj_local(&objs[o], to);
           fprintf(stderr, "   local (%.3f %.3f %.3f)->(%.3f %.3f %.3f) np=%d env anchor=%d\n", l.x, l.y, l.z, l2.x, l2.y, l2.z, objs[o].shape->np, e->anchor);
@@ -737,7 +749,13 @@ static void exec_stmt(Env *e, int ni) {
       game_win(node_data(nd)[0]);
       return;
     case OP_LOSE: game_lose(node_data(nd)[0]); return;
-    case OP_SET_SCORE: return;
+    case OP_SET_SCORE:
+      if (connected(nd, 0)) hud_score = in_num(e, nd, 0);
+#ifdef HOST
+      if (getenv("ND_SDBG")) fprintf(stderr, "score f%d %.2f\n", vm_frame_count, hud_score);
+#endif
+      if (connected(nd, 1)) hud_coins = in_num(e, nd, 1);
+      return;
     case OP_SET_CAMERA: {
       vec3 pos;
       quat rot;

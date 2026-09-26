@@ -11,7 +11,7 @@ FONTS = [
     # name, pixel size, characters
     ('font_s', 11, ''.join(chr(c) for c in range(32, 127))),
     ('font_m', 14, ''.join(chr(c) for c in range(32, 127))),
-    ('font_l', 20, ' 0123456789:DGLMTadegilmnorstv'),
+    ('font_l', 20, ' .0123456789:DGLMTadegilmnorstv'),
 ]
 
 

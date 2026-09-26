@@ -32,9 +32,11 @@
 static int hud_t;
 static uint8_t hud_btn, hud_used;
 static int fade_l, fade_r;
+float hud_score, hud_coins;
 
 void hud_reset(void) {
   hud_t = 0;
+  hud_score = hud_coins = -1;
   hud_btn = hud_used = 0;
   fade_l = fade_r = 32;
 }
@@ -58,6 +60,70 @@ static void hint_box(int x, int y, const Icon *ic, bool on) {
     g_rect(x, y + 2, 2, 14, C_WHITE, 20);
     g_rect(x + 16, y + 2, 2, 14, C_WHITE, 20);
     g_icon(ic, x + 6, y + 6, C_WHITE, 24);
+  }
+}
+
+/* Set Score counter text: white halo, dark outline and a face with a darker extruded bottom */
+static void counter_text(const Font *f, int xr, int y, const char *s, uint16_t face, uint16_t side, uint16_t outl,
+                         int depth) {
+  int x = xr - g_text_w(f, s);
+  for (int dy = -2; dy <= depth + 2; dy++)
+    for (int dx = -2; dx <= 2; dx++)
+      if ((dx != -2 && dx != 2) || (dy != -2 && dy != depth + 2)) g_text(f, x + dx, y + dy, s, C_WHITE, 32);
+  for (int dy = -1; dy <= depth + 1; dy++)
+    for (int dx = -1; dx <= 1; dx++) g_text(f, x + dx, y + dy, s, outl, 32);
+  for (int dy = depth; dy > 0; dy--) g_text(f, x, y + dy, s, side, 32);
+  g_text(f, x, y, s, face, 32);
+}
+
+/* the gold coin next to the coin count: a diamond with a raised rim and a thick lower edge */
+static void coin_icon(int cx, int cy) {
+  enum { R = 5, E = 2 };
+  for (int y = cy - R - 2; y <= cy + R + E + 2; y++) {
+    if (y < gc.y0 || y >= gc.y1) continue;
+    for (int x = cx - R - 2; x <= cx + R + 2; x++) {
+      int dx = x - cx, dy = y - cy, ax = dx < 0 ? -dx : dx;
+      int d = ax + (dy < 0 ? -dy : dy);
+      int de = ax + (dy < 0 ? -dy : dy > E ? dy - E : 0);
+      uint16_t c;
+      int a = 32;
+      if (de > R + 2) continue;
+      if (de == R + 2) c = C_WHITE, a = 24;
+      else if (de == R + 1) c = C_OUTLINE;
+      else if (d > R) c = RGB(0xca, 0x84, 0x00);
+      else if (d == R) c = dx + dy < 0 ? RGB(0xff, 0xff, 0x80) : RGB(0xff, 0xd8, 0x00);
+      else if (d > 2) c = RGB(0xff, 0xd8, 0x00);
+      else if (d == 2) c = dx + dy < 0 ? RGB(0xca, 0x84, 0x00) : RGB(0xff, 0xe0, 0x00);
+      else c = RGB(0xed, 0xaf, 0x00);
+      g_rect(x, y, 1, 1, c, a);
+    }
+  }
+}
+
+static char *fmt_uint(char *p, unsigned v) {
+  char t[10];
+  int n = 0;
+  do t[n++] = (char)('0' + v % 10), v /= 10;
+  while (v && n < 10);
+  while (n) *p++ = t[--n];
+  return p;
+}
+
+static void draw_counters(void) {
+  char buf[16];
+  if (hud_score >= 0 && gc.y0 < 38) {
+    unsigned t = hud_score < 9e7f ? (unsigned)(hud_score * 10 + 0.5f) : 999999999u;
+    char *p = fmt_uint(buf, t / 10);
+    *p++ = '.';
+    *p++ = (char)('0' + t % 10);
+    *p = 0;
+    counter_text(&font_l, 312, 18 - font_l.cap_top, buf, C_WHITE, RGB(0xb8, 0xbe, 0xcc), C_OUTLINE, 2);
+  }
+  if (hud_coins >= 0 && gc.y1 > 28 && gc.y0 < 48) {
+    *fmt_uint(buf, hud_coins < 4e9f ? (unsigned)(hud_coins + 0.5f) : 0) = 0;
+    counter_text(&font_s, 300, 34 - font_s.cap_top, buf, RGB(0xff, 0xd8, 0x00), RGB(0xc0, 0x99, 0x00),
+                 RGB(0x3f, 0x30, 0x00), 1);
+    coin_icon(306, 38);
   }
 }
 
@@ -92,6 +158,7 @@ void hud_draw(uint16_t *px, int y, int n) {
       draw_pill(buf, py);
     }
   }
+  draw_counters();
   if (y + n > 104 && y < 122) {
     hint_box(16, 104, &ic_left, hud_btn & 1);
     hint_box(286, 104, &ic_right, (hud_btn & 2) != 0);
