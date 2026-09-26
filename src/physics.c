@@ -18,8 +18,8 @@ vec3 phys_gravity = {0, -9.8f, 0};
 /* tunables (calibrated against the original game) */
 float k_mass_scale = 1.0f;
 float k_default_friction = 0.5f;
-float k_motor_scale = 300.0f; /* the original's motors are effectively traction limited */
-float k_lin_motor_scale = 300.0f; /* linear motors too */
+float k_motor_scale = 60.0f; /* Fancade's Bullet takes the motor force as the impulse per 1/60 s step */
+float k_lin_motor_scale = 60.0f;
 float k_linear_damping = 0.0f;
 float k_angular_damping = 0.0f;
 
@@ -419,34 +419,39 @@ static void body_mass(Body *b) {
   const Shape *s = o->shape;
   b->mass = o->mass * k_mass_scale;
   if (b->mass <= 0) b->mass = 0.01f;
-  /* inertia about the world z axis from the voxel distribution (per component moments), scaled to the mass */
-  float I = 0, m = 0;
+  /* Bullet's compound shape: the inertia of a solid box the size of the colliders' bounds */
+  float lo[3] = {1e9f, 1e9f, 1e9f}, hi[3] = {-1e9f, -1e9f, -1e9f};
   for (int i = 0; i < s->np; i++) {
     const Block *bk = blocks[s->blk[i]];
-    int comp = PK_C(s->key[i]);
-    float n = bk->cnt[comp];
-    if (n <= 0) continue;
-    float c0 = PK_X(s->key[i]) - s->com.x, c1 = PK_Y(s->key[i]) - s->com.y, c2 = PK_Z(s->key[i]) - s->com.z;
-    const float *sm = bk->sum + comp * 3, *mo = bk->mom + comp * 6;
-    /* second moments of the voxel centres l = cell + v, in world units */
-    float s0 = sm[0] / 8, s1 = sm[1] / 8, s2 = sm[2] / 8;
-    float mxx = n * c0 * c0 + 2 * c0 * s0 + mo[0] / 64, myy = n * c1 * c1 + 2 * c1 * s1 + mo[1] / 64;
-    float mzz = n * c2 * c2 + 2 * c2 * s2 + mo[2] / 64, mxy = n * c0 * c1 + c0 * s1 + c1 * s0 + mo[3] / 64;
-    float mxz = n * c0 * c2 + c0 * s2 + c2 * s0 + mo[4] / 64, myz = n * c1 * c2 + c1 * s2 + c2 * s1 + mo[5] / 64;
-    /* the body may be turned about x or y: sum of (row . l)^2 over the two rows in the plane */
-    for (int r = 0; r < 2; r++) {
-      float a = r ? b->m10 : b->m00, bb = r ? b->m11 : b->m01, cc = r ? b->m12 : b->m02;
-      I += a * a * mxx + bb * bb * myy + cc * cc * mzz + 2 * (a * bb * mxy + a * cc * mxz + bb * cc * myz);
+    int coll = bk->flags & 3;
+    if (!coll) continue;
+    uint32_t k = s->key[i];
+    float a[3], c[3];
+    if (coll == 2) {
+      vec3 cc;
+      float r;
+      part_sphere(bk, PK_C(k), k, &cc, &r);
+      a[0] = cc.x - r, a[1] = cc.y - r, a[2] = cc.z - r, c[0] = cc.x + r, c[1] = cc.y + r, c[2] = cc.z + r;
+    } else {
+      const uint8_t *bb = bk->bb + PK_C(k) * 6;
+      if (bb[0] > bb[3]) continue;
+      int p[3] = {PK_X(k), PK_Y(k), PK_Z(k)};
+      for (int d = 0; d < 3; d++) a[d] = p[d] + bb[d] / 8.0f, c[d] = p[d] + (bb[d + 3] + 1) / 8.0f;
     }
-    I += n / 384.0f;
-    m += n;
+    for (int d = 0; d < 3; d++) {
+      if (a[d] < lo[d]) lo[d] = a[d];
+      if (c[d] > hi[d]) hi[d] = c[d];
+    }
   }
-  if (m <= 0) {
-    I = 1;
-    m = 1;
+  if (lo[0] > hi[0]) {
+    /* no colliders: the bounds of its voxels */
+    lo[0] = s->bmin.x, lo[1] = s->bmin.y, lo[2] = s->bmin.z;
+    hi[0] = s->bmax.x, hi[1] = s->bmax.y, hi[2] = s->bmax.z;
   }
-  b->inertia = I / m * b->mass;
-  if (s->sphere) b->inertia = 0.4f * b->mass * s->radius * s->radius;
+  float lx = hi[0] - lo[0], ly = hi[1] - lo[1], lz = hi[2] - lo[2], k = b->mass / 12;
+  float ix = k * (ly * ly + lz * lz), iy = k * (lx * lx + lz * lz), iz = k * (lx * lx + ly * ly);
+  /* about the world z axis (the body may be turned about x or y) */
+  b->inertia = b->m20 * b->m20 * ix + b->m21 * b->m21 * iy + b->m22 * b->m22 * iz;
   if (b->inertia < 1e-4f) b->inertia = 1e-4f;
   b->invm = 1.0f / b->mass;
   b->invi = 1.0f / b->inertia;
@@ -1114,7 +1119,8 @@ static void collide_static(Body *bd, const WElem *we, int so) {
           collide_elems(&le, &se);
           /* faces shared with a neighbouring collider are internal: drop contacts pushing through them, and
              at a corner where one of the two faces is internal, push along the other face only */
-          float qz = (fmaxf(le.z0, mnz) + fminf(le.z1, mxz)) * 0.5f;
+          /* a sphere touches at its centre's depth; a box anywhere in the shared depth */
+          float qz = le.circle ? fminf(fmaxf((le.z0 + le.z1) * 0.5f, mnz), mxz) : (fmaxf(le.z0, mnz) + fminf(le.z1, mxz)) * 0.5f;
           for (int c = before; c < ncon; c++) {
             Contact *k = &con[c];
             float nx = k->nx, ny = k->ny, px = k->px, py = k->py;
@@ -1131,6 +1137,21 @@ static void collide_static(Body *bd, const WElem *we, int so) {
                 if (dep <= 0) drop = true;
                 else if (iny) k->nx = sx, k->ny = 0, k->py = ccy, k->depth = dep;
                 else k->nx = 0, k->ny = sy, k->px = ccx, k->depth = dep;
+              } else if (inx || iny) {
+                /* a box on a tiled surface: push along the surface's face, from the box's deepest corner */
+                float fx = iny ? sx : 0, fy = iny ? 0 : sy;
+                float face = fx > 0 ? mxx : fx < 0 ? -mnx : fy > 0 ? mxy : -mny;
+                float ex = fabsf(le.ux * fx + le.uy * fy) * le.hx + fabsf(-le.uy * fx + le.ux * fy) * le.hy;
+                float dep = face - ((le.cx * fx + le.cy * fy) - ex);
+                if (dep <= 0) drop = true;
+                else {
+                  /* the corner of the box furthest against the face */
+                  float ax = (le.ux * fx + le.uy * fy) > 0 ? -1.0f : 1.0f, ay = (-le.uy * fx + le.ux * fy) > 0 ? -1.0f : 1.0f;
+                  float qx = le.cx + ax * le.hx * le.ux - ay * le.hy * le.uy, qy = le.cy + ax * le.hx * le.uy + ay * le.hy * le.ux;
+                  k->nx = fx, k->ny = fy, k->depth = dep;
+                  if (fx != 0) k->px = fx > 0 ? mxx : mnx, k->py = fminf(fmaxf(qy, mny), mxy);
+                  else k->py = fy > 0 ? mxy : mny, k->px = fminf(fmaxf(qx, mnx), mxx);
+                }
               }
             }
             if (drop) {
@@ -1480,15 +1501,16 @@ static void solve_joints(bool first) {
       /* spring: Bullet's 6DofSpring2 row, velocity target rv0 + f with the impulse clamped to f */
       if (x && (j->spring >> k & 1) && (free_ || lo < hi)) {
         if (first) {
-          /* Bullet limits stiff springs to what the time step can sample, and over-damping */
-          float mr;
-          if (k < 2) mr = 1.0f / ((A ? A->invm : 0) + B->invm);
-          else mr = 1.0f / ((A ? A->invi * A->lockr : 0) + B->invi * B->lockr + 1e-9f);
+          /* Bullet limits stiff springs to what the time step can sample, and over-damping, by the lighter body */
+          float mr = 1.0f / B->invm;
+          if (A && A->mass < mr) mr = A->mass;
           float ks = x->k[k], kd = x->c[k];
           if (0.25f < sqrtf(ks / mr) * DT) ks = mr / (DT * DT * 16.0f);
           if (kd * DT > mr) kd = mr / DT;
-          float fd = -kd * rv * DT, f = -ks * err[k] * DT + fd;
-          t->spt[k] = rv + f;
+          /* Fancade's Bullet takes the spring's velocity from the bodies' centres, not the anchors */
+          float rs = k < 2 ? (B->vx - (A ? A->vx : 0)) * nx + (B->vy - (A ? A->vy : 0)) * ny : rv;
+          float fd = -kd * rs * DT, f = -ks * err[k] * DT + fd;
+          t->spt[k] = rs + f;
           t->splo[k] = fminf(fminf(f, fd), 0);
           t->sphi[k] = fmaxf(fmaxf(f, fd), 0);
         }
@@ -1696,11 +1718,31 @@ void phys_debug(int frame) {
     }
     printf(" ncon=%d\n", ncon);
   }
+  if (getenv("ND_GEO") && frame == 0) {
+    float g0, g1, g2, g3;
+    sscanf(getenv("ND_GEO"), "%f,%f,%f,%f", &g0, &g1, &g2, &g3);
+    for (int so = 0; so < nobj; so++) {
+      Obj *os = &objs[so];
+      if (os->flags & (OF_DYNAMIC | OF_DEAD | OF_TEMPLATE)) continue;
+      const Shape *sh = os->shape;
+      if (!sh) continue;
+      for (int i = 0; i < sh->np; i++) {
+        const Block *bk = blocks[sh->blk[i]];
+        if (!(bk->flags & 3)) continue;
+        uint32_t k = sh->key[i];
+        const uint8_t *bb = bk->bb + PK_C(k) * 6;
+        vec3 mn = obj_world(os, v3(PK_X(k) + bb[0] / 8.0f, PK_Y(k) + bb[1] / 8.0f, PK_Z(k) + bb[2] / 8.0f));
+        vec3 mx = obj_world(os, v3(PK_X(k) + (bb[3] + 1) / 8.0f, PK_Y(k) + (bb[4] + 1) / 8.0f, PK_Z(k) + (bb[5] + 1) / 8.0f));
+        if (fmaxf(mn.x, mx.x) < g0 || fminf(mn.x, mx.x) > g2 || fmaxf(mn.y, mx.y) < g1 || fminf(mn.y, mx.y) > g3) continue;
+        printf("geo s%d coll%d x[%.3f,%.3f] y[%.3f,%.3f] z[%.3f,%.3f]\n", so, bk->flags & 3, mn.x, mx.x, mn.y, mx.y, mn.z, mx.z);
+      }
+    }
+  }
   if (getenv("ND_CON") && frame >= atoi(getenv("ND_CON")) && frame < atoi(getenv("ND_CON")) + 80) {
     printf("f%d:", frame);
     for (int i = 0; i < ncon; i++) {
       Contact *c = &con[i];
-      printf(" b%d-s%d(%.2f,%.2f p=%.2f,%.2f jn=%.2f)", c->a, c->sobj, c->nx, c->ny, c->px, c->py, c->jn);
+      printf(" b%d-s%d(%.2f,%.2f p=%.2f,%.2f jn=%.2f jt=%.2f mu=%.2f)", c->a, c->sobj, c->nx, c->ny, c->px, c->py, c->jn, c->jt, c->mu);
     }
     printf("\n");
   }
@@ -1712,12 +1754,16 @@ void phys_debug(int frame) {
     if (b->obj < 0) continue;
     printf("  b%d obj%d m=%.2f I=%.3f pos=(%.3f,%.3f,%.3f) a=%.3f v=(%.3f,%.3f) w=%.3f nel=%d z=[%.2f,%.2f] lock=%g%g%g\n", i, b->obj,
            b->mass, b->inertia, b->x, b->y, b->z, b->a, b->vx, b->vy, b->w, b->nel, b->zmin, b->zmax, b->lockx, b->locky, b->lockr);
+    if (frame == 0)
+      for (int k = 0; k < b->nel; k++)
+        printf("    el%d %s c=(%.3f,%.3f) h=(%.3f,%.3f) z=[%.3f,%.3f] fr=%.2f\n", k, b->el[k].circle ? "circ" : "box", b->el[k].cx, b->el[k].cy,
+               b->el[k].hx, b->el[k].hy, b->el[k].z0, b->el[k].z1, obj_friction(&objs[b->obj]));
   }
   for (int j = 0; j < njoints; j++) {
     Joint *jt = &joints[j];
     JointExt z = {{0}}, *x = jt->ext ? jt->ext : &z;
-    printf("  j%d a=%d b=%d lo=(%.2f,%.2f,%.2f) hi=(%.2f,%.2f,%.2f) k=(%.1f,%.1f,%.1f) mv=%.2f mf=%.2f\n", j, jt->a, jt->b, jt->lo[0],
-           jt->lo[1], jt->lo[2], jt->hi[0], jt->hi[1], jt->hi[2], x->k[0], x->k[1], x->k[2], x->mv[2], x->mf[2]);
+    printf("  j%d a=%d b=%d lo=(%.2f,%.2f,%.2f) hi=(%.2f,%.2f,%.2f) k=(%.1f,%.1f,%.1f) c=%.1f mv=%.2f mf=%.2f\n", j, jt->a, jt->b, jt->lo[0],
+           jt->lo[1], jt->lo[2], jt->hi[0], jt->hi[1], jt->hi[2], x->k[0], x->k[1], x->k[2], x->c[1], x->mv[2], x->mf[2]);
   }
 }
 #endif

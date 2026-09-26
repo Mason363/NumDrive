@@ -51,7 +51,6 @@ typedef struct {
   /* per component stats (voxel units) */
   uint16_t *cnt;
   float *sum;  /* ncomp * 3: sums of voxel centres */
-  float *mom;  /* ncomp * 6: sums of xx, yy, zz, xy, xz, yz of voxel centres */
   uint8_t *bb; /* ncomp * 6: min xyz, max xyz (inclusive) */
 } Block;
 

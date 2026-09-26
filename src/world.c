@@ -223,9 +223,9 @@ const char *level_name(int i) {
 Block *blocks[256];
 static uint8_t need_blk[256];
 
-/* block record: u8 flags, u8 ncomp, per component (u16 voxel count, f32 sums[3], f32 moments[6], u8 bounds[6]),
+/* block record: u8 flags, u8 ncomp, per component (u16 voxel count, f32 sums[3], u8 bounds[6]),
  * then the part kept in RAM: u8 nbox, boxes (3 bytes each), u8 full faces, per face u8 count and quads (3 bytes) */
-#define COMP_STATS 44
+#define COMP_STATS 20
 static uint32_t block_tail(const uint8_t *t) {
   const uint8_t *p = t + 1 + 3 * t[0] + 1;
   for (int f = 0; f < 6; f++) p += 1 + 3 * p[0];
@@ -257,15 +257,13 @@ static bool load_blocks(void) {
         b->ncomp = (uint8_t)ncomp;
         b->cnt = arena_alloc(2 * ncomp);
         b->sum = arena_alloc(12 * ncomp);
-        b->mom = arena_alloc(24 * ncomp);
         b->bb = arena_alloc(6 * ncomp);
-        if (!b->cnt || !b->sum || !b->mom || !b->bb) FAIL("load_blocks");
+        if (!b->cnt || !b->sum || !b->bb) FAIL("load_blocks");
         for (int c = 0; c < ncomp; c++) {
           const uint8_t *q = st + COMP_STATS * c;
           b->cnt[c] = rd16(q);
           for (int k = 0; k < 3; k++) b->sum[c * 3 + k] = rdf(q + 2 + 4 * k);
-          for (int k = 0; k < 6; k++) b->mom[c * 6 + k] = rdf(q + 14 + 4 * k);
-          memcpy(b->bb + c * 6, q + 38, 6);
+          memcpy(b->bb + c * 6, q + 14, 6);
         }
         memcpy(keep, t, tl);
         b->nbox = keep[0];
@@ -361,8 +359,8 @@ static void shape_finish(Shape *s) {
     }
     s->occ[i] = m;
   }
-  /* mass, com, bounds */
-  float m = 0, sx = 0, sy = 0, sz = 0;
+  /* mass: the volume of the parts' voxel bounds (Fancade's colliders); com: the voxels' centre; bounds */
+  float m = 0, v = 0, sx = 0, sy = 0, sz = 0;
   float bx0 = 1e9f, by0 = 1e9f, bz0 = 1e9f, bx1 = -1e9f, by1 = -1e9f, bz1 = -1e9f;
   uint8_t coll = 0;
   for (int i = 0; i < s->np; i++) {
@@ -375,6 +373,7 @@ static void shape_finish(Shape *s) {
     sy += b->sum[c * 3 + 1] + cy * b->cnt[c];
     sz += b->sum[c * 3 + 2] + cz * b->cnt[c];
     const uint8_t *bb = b->bb + c * 6;
+    if (bb[0] <= bb[3]) v += (bb[3] - bb[0] + 1) * (bb[4] - bb[1] + 1) * (bb[5] - bb[2] + 1);
     if (cx + bb[0] < bx0) bx0 = cx + bb[0];
     if (cy + bb[1] < by0) by0 = cy + bb[1];
     if (cz + bb[2] < bz0) bz0 = cz + bb[2];
@@ -383,33 +382,7 @@ static void shape_finish(Shape *s) {
     if (cz + bb[5] + 1 > bz1) bz1 = cz + bb[5] + 1;
     if (b->flags & 3) coll = 1;
   }
-  s->mass = m / 512.0f;
-#ifdef HOST
-  {
-    static float vm = -1;
-    if (vm < 0) vm = getenv("ND_VOXMASS") ? atof(getenv("ND_VOXMASS")) : 1;
-    s->mass *= vm;
-    if (getenv("ND_BOXMASS")) {
-      float v = 0;
-      for (int i = 0; i < s->np; i++) {
-        const uint8_t *bb = blocks[s->blk[i]]->bb + PK_C(s->key[i]) * 6;
-        if (bb[0] <= bb[3]) v += (bb[3] - bb[0] + 1) * (bb[4] - bb[1] + 1) * (bb[5] - bb[2] + 1) / 512.0f;
-      }
-      s->mass = v;
-    }
-    if (getenv("ND_CELLMASS")) {
-      int cells = 0;
-      float cx = 0, cy = 0, cz = 0;
-      for (int i = 0; i < s->np; i++)
-        if (i == 0 || (s->key[i] & ~7u) != (s->key[i - 1] & ~7u)) {
-          cells++;
-          cx += PK_X(s->key[i]) + 0.5f, cy += PK_Y(s->key[i]) + 0.5f, cz += PK_Z(s->key[i]) + 0.5f;
-        }
-      s->mass = cells;
-      if (atoi(getenv("ND_CELLMASS")) == 2 && cells) s->com = v3(cx / cells, cy / cells, cz / cells);
-    }
-  }
-#endif
+  s->mass = v / 512.0f;
   s->com = m > 0 ? v3(sx / m / 8, sy / m / 8, sz / m / 8) : v3(0, 0, 0);
   {
     /* Fancade's object position: the centre of its bounds, where a stock block counts its whole cell
@@ -735,6 +708,14 @@ bool world_load_level(int index) {
           h = (h ^ sh->blk[j]) * 16777619u;
         }
         fprintf(stderr, "SHAPE r%d i%d np %d hash %08x\n", r, i, sh->np, h);
+        if (r < 0 && getenv("ND_SHPARTS") && atoi(getenv("ND_SHPARTS")) == i)
+          for (int j = 0; j < sh->np; j++) {
+            const Block *b = blocks[sh->blk[j]];
+            int c = PK_C(sh->key[j]);
+            const uint8_t *bb = b->bb + c * 6;
+            fprintf(stderr, "  part cell(%d,%d,%d) comp %d coll %d cnt %d bb[%d-%d,%d-%d,%d-%d]\n", PK_X(sh->key[j]), PK_Y(sh->key[j]), PK_Z(sh->key[j]), c,
+                    b->flags & 3, (int)b->cnt[c], bb[0], bb[3], bb[1], bb[4], bb[2], bb[5]);
+          }
       }
     }
   }
