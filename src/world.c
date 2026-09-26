@@ -407,6 +407,20 @@ static void shape_finish(Shape *s) {
   }
 #ifdef HOST
   if (getenv("ND_COMORIGIN")) s->com = s->origin;
+  if (getenv("ND_COMCELL") && s->np) {
+    /* 1: bounds of the cells of every block, 2: of the blocks with a collider */
+    int mode = atoi(getenv("ND_COMCELL"));
+    float lo[3] = {1e9f, 1e9f, 1e9f}, hi[3] = {-1e9f, -1e9f, -1e9f};
+    for (int i = 0; i < s->np; i++) {
+      if (mode == 2 && !(blocks[s->blk[i]]->flags & 3)) continue;
+      int c[3] = {PK_X(s->key[i]), PK_Y(s->key[i]), PK_Z(s->key[i])};
+      for (int a = 0; a < 3; a++) {
+        if (c[a] < lo[a]) lo[a] = c[a];
+        if (c[a] + 1 > hi[a]) hi[a] = c[a] + 1;
+      }
+    }
+    if (lo[0] <= hi[0]) s->com = v3((lo[0] + hi[0]) * 0.5f, (lo[1] + hi[1]) * 0.5f, (lo[2] + hi[2]) * 0.5f);
+  }
 #endif
   s->bmin = v3(bx0 / 8, by0 / 8, bz0 / 8);
   s->bmax = v3(bx1 / 8, by1 / 8, bz1 / 8);

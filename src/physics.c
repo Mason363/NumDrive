@@ -56,7 +56,8 @@ typedef struct {
   int16_t a, b;           /* body indices; b may be -1 for static */
   int16_t sobj;           /* static object id when b == -1 */
   uint8_t acirc;          /* a touches with a circle: its lever reaches its own surface, p - n * depth */
-  uint8_t z3;             /* a body that can move in z takes part: normal and friction in 3D */
+  uint8_t z3;             /* a body that can move in z takes part: normal and friction in 3D (2: a ball
+                             touches, which rolls across instead of sliding) */
   float px, py;           /* world contact point (on b's surface) */
   float nx, ny;           /* normal from a to b (pointing out of b into a) */
   float nz, jz;           /* z3 only: the normal's depth part, friction impulse along z */
@@ -568,7 +569,7 @@ static Body *wake(int o) {
 
 void phys_set_velocity(int o, const vec3 *vel, const vec3 *spin) {
 #ifdef HOST
-  if (getenv("ND_PDBG")) fprintf(stderr, "setvel obj%d %s %s\n", o, vel ? "v" : "-", spin ? "w" : "-");
+  if (getenv("ND_PDBG")) fprintf(stderr, "setvel obj%d v=%s(%.2f %.2f %.2f) w=%s(%.2f %.2f %.2f)\n", o, vel ? "" : "-", vel ? vel->x : 0, vel ? vel->y : 0, vel ? vel->z : 0, spin ? "" : "-", spin ? spin->x : 0, spin ? spin->y : 0, spin ? spin->z : 0);
 #endif
   Body *b = wake(o);
   if (!b) return;
@@ -787,7 +788,7 @@ void phys_con_motor(int c, bool ang, vec3 v, vec3 f) {
 
 /* --------------------------------------------------------------- contacts */
 static int cur_a, cur_b, cur_sobj;
-static uint8_t cur_acirc;
+static uint8_t cur_acirc, cur_bcirc;
 static float cur_mu, cur_rest;
 static float cur_zc; /* a body free in depth: its com's z in the static object's frame (else NAN) */
 
@@ -810,6 +811,7 @@ static void add_contact(float px, float py, float nx, float ny, float depth) {
   c->mu = cur_mu;
   c->rest = cur_rest;
   c->z3 = bodies[cur_a].lockz != 0 || (cur_b >= 0 && bodies[cur_b].lockz != 0);
+  if (c->z3 && (cur_acirc || cur_bcirc)) c->z3 = 2;
 }
 
 /* world-space 2D element */
@@ -988,6 +990,7 @@ static void col_bb(const WElem *A, const WElem *B) {
 static void collide_elems(const WElem *a, const WElem *b) {
   if (a->z1 <= b->z0 + 1e-4f || b->z1 <= a->z0 + 1e-4f) return;
   cur_acirc = a->circle;
+  cur_bcirc = b->circle;
   if (a->circle && b->circle) col_cc(a, b);
   else if (a->circle) col_cb(a, b, false);
   else if (b->circle) col_cb(b, a, true);
@@ -1414,6 +1417,7 @@ static void gen_contacts(void) {
       for (int e = 0; e < na; e++) {
         const WElem *w = &wa[e];
         cur_acirc = w->circle;
+        cur_bcirc = 0;
         if (w->circle) {
           if (w->cy < w->hx) add_contact(w->cx, 0, 0, 1, w->hx - w->cy);
           continue;
@@ -1442,8 +1446,7 @@ static void gen_contacts(void) {
       WElem wb[MAX_ELEMS];
       int nb = B->nel < MAX_ELEMS ? B->nel : MAX_ELEMS;
       for (int e = 0; e < nb; e++) elem_world(B, &B->el[e], &wb[e]);
-      bool t3 = tilted(A) || tilted(B);
-      bool zf = A->lockz || B->lockz;
+      bool zf = A->lockz || B->lockz, t3 = zf || tilted(A) || tilted(B);
       for (int e = 0; e < na; e++)
         for (int f = 0; f < nb; f++) {
           float n3[4];
@@ -1527,7 +1530,7 @@ static void solve_contact3(Contact *c) {
   if (B) apply3(B, c->rbx, c->rby, -c->nx * dj, -c->ny * dj, -c->nz * dj);
   float t[2][3], lim = c->mu * c->jn;
   tangents3(c, t[0], t[1]);
-  for (int k = 0; k < 2; k++) {
+  for (int k = 0; k < (c->z3 == 2 ? 1 : 2); k++) {
     const float *u = t[k];
     vel_at(A, c->rax, c->ray, &vax, &vay);
     if (B) vel_at(B, c->rbx, c->rby, &vbx, &vby);

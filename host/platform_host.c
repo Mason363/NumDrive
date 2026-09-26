@@ -5,6 +5,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include "../src/platform.h"
+#include "../src/render.h"
+#ifndef ARMTEST
+#include <sys/mman.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/prctl.h>
+#include <math.h>
+#endif
 
 static uint16_t fb[SCREEN_W * SCREEN_H];
 static int frame;
@@ -14,6 +22,29 @@ static char keys[4096];
 static const char *outdir = "out";
 static int inited;
 
+#ifndef ARMTEST
+/* ND_SEARCH="seg,beam,frames": beam search over held keys (none / right / left per segment) for a win.
+   Workers are forked processes paused at segment ends; the first process coordinates. */
+#define SW 512
+#define SPATH 256
+typedef struct {
+  volatile int cmd[SW], arg[SW][3], done[SW], status[SW];
+  volatile float score[SW], cy[SW];
+  volatile unsigned char path[SW][SPATH];
+  volatile int plen[SW];
+} Search;
+static Search *sr;
+static int s_seg, s_beam, s_frames, s_id = -1, s_act, s_outcome;
+static void s_checkpoint(void);
+#endif
+void host_outcome(int won) {
+#ifndef ARMTEST
+  if (!s_outcome) s_outcome = won;
+#else
+  (void)won;
+#endif
+}
+
 static void init(void) {
   if (inited) return;
   inited = 1;
@@ -22,6 +53,15 @@ static void init(void) {
   if ((s = getenv("ND_SHOTS"))) snprintf(shots, sizeof shots, ",%s,", s);
   if ((s = getenv("ND_KEYS"))) snprintf(keys, sizeof keys, "%s", s);
   if ((s = getenv("ND_OUT"))) outdir = s;
+#ifndef ARMTEST
+  if ((s = getenv("ND_SEARCH"))) {
+    s_seg = 20, s_beam = 8, s_frames = 1800;
+    sscanf(s, "%d,%d,%d", &s_seg, &s_beam, &s_frames);
+    max_frames = 1 << 30;
+    sr = mmap(0, sizeof(Search), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    memset((void *)sr, 0, sizeof(Search));
+  }
+#endif
 }
 
 int host_frame(void) { return frame; }
@@ -56,6 +96,12 @@ static int keycode(const char *n) {
 
 uint64_t plat_keys(void) {
   init();
+#ifndef ARMTEST
+  if (sr) {
+    if (s_id < 0) s_checkpoint(); /* frame 0: become the coordinator and the first worker */
+    return s_act == 1 ? KEY(K_RIGHT) : s_act == 2 ? KEY(K_LEFT) : 0;
+  }
+#endif
   uint64_t k = 0;
   char buf[4096];
   snprintf(buf, sizeof buf, "%s", keys);
@@ -100,5 +146,105 @@ void plat_frame_done(void) {
   snprintf(tag, sizeof tag, ",%d,", frame);
   if (strstr(shots, ",all,") || strstr(shots, tag)) save();
   frame++;
+#ifndef ARMTEST
+  if (sr && (frame % s_seg == 0 || s_outcome)) s_checkpoint();
+#endif
   if (frame >= max_frames) exit(0);
 }
+#ifndef ARMTEST
+
+static void s_wait_cmd(void) {
+  for (;;) {
+    while (!sr->cmd[s_id]) usleep(100);
+    int c = sr->cmd[s_id];
+    sr->cmd[s_id] = 0;
+    if (c == 2) _exit(0);
+    /* expand: a child per action; this process is done */
+    for (int a = 0; a < 3; a++) {
+      int id = sr->arg[s_id][a];
+      if (fork() == 0) {
+        memcpy((void *)sr->path[id], (void *)sr->path[s_id], SPATH);
+        sr->plen[id] = sr->plen[s_id];
+        if (sr->plen[id] < SPATH) sr->path[id][sr->plen[id]++] = (unsigned char)a;
+        s_id = id;
+        s_act = a;
+        return;
+      }
+    }
+    _exit(0);
+  }
+}
+
+static void s_report(void) {
+  sr->score[s_id] = s_outcome == 1 ? 1e6f - frame : s_outcome == 2 ? -1e6f : cam.focus.x;
+  sr->cy[s_id] = cam.focus.y;
+  sr->status[s_id] = s_outcome;
+  __sync_synchronize();
+  sr->done[s_id] = 1;
+}
+
+static void s_coordinate(void) {
+  int beam[64], nb = 1, next = 1;
+  if (s_beam > 64) s_beam = 64;
+  beam[0] = 0;
+  while (!sr->done[0]) usleep(100);
+  for (int gen = 0; gen * s_seg < s_frames; gen++) {
+    int kids[192], nk = 0;
+    for (int i = 0; i < nb; i++) {
+      for (int a = 0; a < 3; a++) {
+        int id = next++ % SW;
+        if (id == 0) id = next++ % SW;
+        sr->done[id] = 0;
+        sr->arg[beam[i]][a] = id;
+        kids[nk++] = id;
+      }
+      __sync_synchronize();
+      sr->cmd[beam[i]] = 1;
+    }
+    for (int i = 0; i < nk; i++)
+      while (!sr->done[kids[i]]) usleep(100);
+    /* best first; a win ends the search */
+    for (int i = 0; i < nk; i++)
+      for (int j = i + 1; j < nk; j++)
+        if (sr->score[kids[j]] > sr->score[kids[i]]) {
+          int t = kids[i];
+          kids[i] = kids[j];
+          kids[j] = t;
+        }
+    int best = kids[0];
+    if (sr->status[best] == 1 || (gen + 1) * s_seg >= s_frames || sr->status[best] == 2) {
+      printf("search %s gen %d score %.2f path ", sr->status[best] == 1 ? "win" : "none", gen, sr->score[best]);
+      for (int i = 0; i < sr->plen[best]; i++) putchar(".RL"[sr->path[best][i]]);
+      putchar('\n');
+      fflush(stdout);
+      for (int i = 0; i < nk; i++) sr->cmd[kids[i]] = 2;
+      usleep(100000); /* let the workers go before their reaper does */
+      exit(0);
+    }
+    /* keep the best, but at most two per spot so the beam spreads over where the car can get */
+    nb = 0;
+    for (int i = 0; i < nk; i++) {
+      int k = kids[i], same = 0;
+      for (int j = 0; j < nb; j++)
+        same += (int)floorf(sr->score[beam[j]]) == (int)floorf(sr->score[k]) && (int)floorf(sr->cy[beam[j]]) == (int)floorf(sr->cy[k]);
+      if (nb < s_beam && sr->status[k] == 0 && same < 2) beam[nb++] = k;
+      else sr->cmd[k] = 2;
+    }
+  }
+  exit(0);
+}
+
+static void s_checkpoint(void) {
+  if (s_id < 0) {
+    /* orphaned workers are adopted and reaped here */
+    signal(SIGCHLD, SIG_IGN);
+    prctl(PR_SET_CHILD_SUBREAPER, 1);
+    s_id = 0;
+    if (fork() != 0) s_coordinate();
+    s_act = 0;
+  }
+  s_report();
+  s_wait_cmd();
+  sr->done[s_id] = 0;
+}
+#endif

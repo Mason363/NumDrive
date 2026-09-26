@@ -21,12 +21,19 @@ enum { ST_PLAY, ST_CARD, ST_LEVELS };
 #define SHOT_FRAMES 10 /* viewfinder shown before the photo */
 
 static int win_timer = -1, lose_timer = -1;
+#ifdef HOST
+void host_outcome(int won);
+#endif
 void game_win(int delay) {
+#ifdef HOST
+  if (win_timer < 0 && lose_timer < 0) host_outcome(1);
+#endif
   if (win_timer < 0 && lose_timer < 0) win_timer = delay > SHOT_FRAMES ? delay : SHOT_FRAMES;
 }
 void game_lose(int delay) {
 #ifdef HOST
   if (getenv("ND_WDBG") && win_timer < 0 && lose_timer < 0) fprintf(stderr, "lose at frame %d\n", vm_frame_count);
+  if (win_timer < 0 && lose_timer < 0) host_outcome(2);
 #endif
   if (win_timer < 0 && lose_timer < 0) lose_timer = delay > SHOT_FRAMES ? delay : SHOT_FRAMES;
 }
