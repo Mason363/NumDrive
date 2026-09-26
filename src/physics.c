@@ -16,6 +16,7 @@ vec3 phys_gravity = {0, -9.8f, 0};
 float k_mass_scale = 1.0f;
 float k_default_friction = 0.5f;
 float k_motor_scale = 300.0f; /* the original's motors are effectively traction limited */
+float k_lin_motor_scale = 300.0f; /* linear motors too */
 float k_linear_damping = 0.0f;
 float k_angular_damping = 0.0f;
 
@@ -33,6 +34,7 @@ typedef struct Body {
   float a;        /* accumulated rotation about z (radians) */
   quat rot;       /* full orientation (object rotation) */
   float m00, m01, m10, m11, m02, m12; /* xy rows of the rotation matrix */
+  float m20, m21, m22;                /* z row */
   float vx, vy, w;
   float pvx, pvy, pw; /* split-impulse pseudo velocities (position correction only) */
   float fx, fy, tq;
@@ -254,6 +256,9 @@ static void body_matrix(Body *b) {
   b->m10 = 2 * (xy + wz);
   b->m11 = 1 - 2 * (xx + zz);
   b->m12 = 2 * (yz - wx);
+  b->m20 = 2 * (xz - wy);
+  b->m21 = 2 * (yz + wx);
+  b->m22 = 1 - 2 * (xx + yy);
 }
 
 static void sync_obj(Body *b) {
@@ -352,7 +357,8 @@ static bool build_elems(Body *b) {
   b->bound = 0;
   for (int i = 0; i < b->nel; i++) {
     Elem *e = &b->el[i];
-    float r = sqrtf(e->cx * e->cx + e->cy * e->cy) + (e->circle ? e->hx : sqrtf(e->hx * e->hx + e->hy * e->hy));
+    float cz = (e->z0 + e->z1) * 0.5f, hz = (e->z1 - e->z0) * 0.5f;
+    float r = sqrtf(e->cx * e->cx + e->cy * e->cy + cz * cz) + (e->circle ? e->hx : sqrtf(e->hx * e->hx + e->hy * e->hy + hz * hz));
     if (r > b->bound) b->bound = r;
   }
   return true;
@@ -362,8 +368,12 @@ static void body_zrange(Body *b) {
   b->zmin = 1e9f;
   b->zmax = -1e9f;
   for (int i = 0; i < b->nel; i++) {
-    if (b->z + b->el[i].z0 < b->zmin) b->zmin = b->z + b->el[i].z0;
-    if (b->z + b->el[i].z1 > b->zmax) b->zmax = b->z + b->el[i].z1;
+    const Elem *e = &b->el[i];
+    float cz = (e->z0 + e->z1) * 0.5f, hz = (e->z1 - e->z0) * 0.5f;
+    float zc = b->z + b->m20 * e->cx + b->m21 * e->cy + b->m22 * cz;
+    float ez = e->circle ? hz : fabsf(b->m20) * e->hx + fabsf(b->m21) * e->hy + fabsf(b->m22) * hz;
+    if (zc - ez < b->zmin) b->zmin = zc - ez;
+    if (zc + ez > b->zmax) b->zmax = zc + ez;
   }
 }
 
@@ -419,6 +429,18 @@ void phys_make_dynamic(int o) {
   body_zrange(b);
   ob->flags |= OF_DYNAMIC;
   ob->body = (int16_t)nbodies++;
+  /* joints made while this object was static now pull on its body */
+  for (int ji = 0; ji < njoints; ji++) {
+    Joint *j = &joints[ji];
+    if (j->a >= 0 || j->sobj != o) continue;
+    vec3 w = obj_world(ob, j->la), ax = qrot(ob->rot, j->axx);
+    float a0 = atan2f(ax.y, ax.x);
+    j->a = ob->body;
+    j->sobj = -1;
+    j->la = qrot(qconj(b->rot), vsub(w, v3(b->x, b->y, b->z)));
+    j->axx = qrot(qconj(b->rot), ax);
+    j->ref += a0 - b->a;
+  }
 }
 
 static Body *body(int o) {
@@ -434,6 +456,7 @@ static Body *body(int o) {
 static float k_fmul = 1.0f;
 static void host_tunables(void) {
   if (getenv("ND_KMOTOR")) k_motor_scale = atof(getenv("ND_KMOTOR"));
+  if (getenv("ND_KLMOTOR")) k_lin_motor_scale = atof(getenv("ND_KLMOTOR"));
   if (getenv("ND_KMASS")) k_mass_scale = atof(getenv("ND_KMASS"));
   if (getenv("ND_KFRIC")) k_default_friction = atof(getenv("ND_KFRIC"));
   if (getenv("ND_FMUL")) k_fmul = atof(getenv("ND_FMUL"));
@@ -543,6 +566,14 @@ void phys_moved(int o) {
   if (b) sync_body(b);
 }
 
+/* hiding an object takes it out of the physics world, which drops its constraints */
+void phys_hidden(int o) {
+  Body *b = body(o);
+  int bi = b ? (int)(b - bodies) : -2;
+  for (int j = 0; j < njoints; j++)
+    if (joints[j].a == bi || joints[j].b == bi || (joints[j].a < 0 && joints[j].sobj == o)) joints[j].b = -2;
+}
+
 void phys_destroyed(int o) {
   Body *b = body(o);
   if (!b) return;
@@ -626,9 +657,9 @@ void phys_con_motor(int c, bool ang, vec3 v, vec3 f) {
     j->mf[2] = fabsf(f.z) * k_motor_scale;
   } else {
     j->mv[0] = v.x;
-    j->mf[0] = fabsf(f.x);
+    j->mf[0] = fabsf(f.x) * k_lin_motor_scale;
     j->mv[1] = v.y;
-    j->mf[1] = fabsf(f.y);
+    j->mf[1] = fabsf(f.y) * k_lin_motor_scale;
   }
 }
 
@@ -662,12 +693,28 @@ typedef struct {
 } WElem;
 
 static void elem_world(const Body *b, const Elem *e, WElem *w) {
-  float cz = (e->z0 + e->z1) * 0.5f;
+  float cz = (e->z0 + e->z1) * 0.5f, hz = (e->z1 - e->z0) * 0.5f;
   w->circle = e->circle;
   w->cx = b->x + b->m00 * e->cx + b->m01 * e->cy + b->m02 * cz;
   w->cy = b->y + b->m10 * e->cx + b->m11 * e->cy + b->m12 * cz;
+  float zc = b->z + b->m20 * e->cx + b->m21 * e->cy + b->m22 * cz;
+  if (e->circle) {
+    w->ux = 1;
+    w->uy = 0;
+    w->hx = w->hy = e->hx;
+    w->z0 = zc - hz;
+    w->z1 = zc + hz;
+    return;
+  }
+  /* the box turned by any 3D rotation, as a rectangle in the plane: oriented along its x axis (or its
+     y axis turned a quarter when x points along z), extents of all three axes projected */
   float ux = b->m00, uy = b->m10;
   float l = sqrtf(ux * ux + uy * uy);
+  if (l < 0.5f) {
+    ux = b->m11;
+    uy = -b->m01;
+    l = sqrtf(ux * ux + uy * uy);
+  }
   if (l < 1e-4f) {
     ux = 1;
     uy = 0;
@@ -677,10 +724,11 @@ static void elem_world(const Body *b, const Elem *e, WElem *w) {
   }
   w->ux = ux;
   w->uy = uy;
-  w->hx = e->hx;
-  w->hy = e->hy;
-  w->z0 = b->z + e->z0;
-  w->z1 = b->z + e->z1;
+  w->hx = fabsf(b->m00 * ux + b->m10 * uy) * e->hx + fabsf(b->m01 * ux + b->m11 * uy) * e->hy + fabsf(b->m02 * ux + b->m12 * uy) * hz;
+  w->hy = fabsf(b->m10 * ux - b->m00 * uy) * e->hx + fabsf(b->m11 * ux - b->m01 * uy) * e->hy + fabsf(b->m12 * ux - b->m02 * uy) * hz;
+  float ez = fabsf(b->m20) * e->hx + fabsf(b->m21) * e->hy + fabsf(b->m22) * hz;
+  w->z0 = zc - ez;
+  w->z1 = zc + ez;
 }
 
 /* contacts between circle A and circle B, normal points from B to A */
@@ -949,7 +997,7 @@ static void gen_contacts(void) {
   ncon = 0;
   for (int i = 0; i < nbodies; i++) {
     Body *A = &bodies[i];
-    if (A->obj < 0 || !(objs[A->obj].flags & OF_COLLIDE)) continue;
+    if (A->obj < 0 || (objs[A->obj].flags & (OF_COLLIDE | OF_VISIBLE)) != (OF_COLLIDE | OF_VISIBLE)) continue;
     Obj *oa = &objs[A->obj];
     WElem wa[MAX_ELEMS];
     int na = A->nel < MAX_ELEMS ? A->nel : MAX_ELEMS;
@@ -957,7 +1005,7 @@ static void gen_contacts(void) {
     /* static objects */
     for (int s = 0; s < nobj; s++) {
       Obj *os = &objs[s];
-      if ((os->flags & (OF_DYNAMIC | OF_DEAD | OF_TEMPLATE)) || !(os->flags & OF_COLLIDE)) continue;
+      if ((os->flags & (OF_DYNAMIC | OF_DEAD | OF_TEMPLATE | OF_COLLIDE | OF_VISIBLE)) != (OF_COLLIDE | OF_VISIBLE)) continue;
       /* AABB check in world */
       const Shape *sh = os->shape;
       vec3 c = obj_world(os, vscale(vadd(sh->bmin, sh->bmax), 0.5f));
@@ -973,10 +1021,30 @@ static void gen_contacts(void) {
       cur_rest = oa->bounce * os->bounce;
       for (int e = 0; e < na; e++) collide_static(A, &wa[e], s);
     }
+    /* Fancade's floor: an endless plane at y = 0 */
+    if (A->y - A->bound < 0) {
+      cur_a = i;
+      cur_b = -1;
+      cur_sobj = -1;
+      cur_mu = mix_friction(oa->friction, 0.5f);
+      cur_rest = 0;
+      for (int e = 0; e < na; e++) {
+        const WElem *w = &wa[e];
+        if (w->circle) {
+          if (w->cy < w->hx) add_contact(w->cx, 0, 0, 1, w->hx - w->cy);
+          continue;
+        }
+        for (int c = 0; c < 4; c++) {
+          float sx = c & 1 ? w->hx : -w->hx, sy = c & 2 ? w->hy : -w->hy;
+          float px = w->cx + w->ux * sx - w->uy * sy, py = w->cy + w->uy * sx + w->ux * sy;
+          if (py < 0) add_contact(px, 0, 0, 1, -py);
+        }
+      }
+    }
     /* other bodies */
     for (int j = i + 1; j < nbodies; j++) {
       Body *B = &bodies[j];
-      if (B->obj < 0 || !(objs[B->obj].flags & OF_COLLIDE)) continue;
+      if (B->obj < 0 || (objs[B->obj].flags & (OF_COLLIDE | OF_VISIBLE)) != (OF_COLLIDE | OF_VISIBLE)) continue;
       float dx = B->x - A->x, dy = B->y - A->y, rr = A->bound + B->bound;
       if (dx * dx + dy * dy > rr * rr) continue;
       if (A->zmax <= B->zmin || B->zmax <= A->zmin) continue;
@@ -1259,7 +1327,7 @@ void phys_step(void) {
   /* external forces */
   for (int i = 0; i < nbodies; i++) {
     Body *b = &bodies[i];
-    if (b->obj < 0) continue;
+    if (b->obj < 0 || !(objs[b->obj].flags & OF_VISIBLE)) continue;
     b->vx += (phys_gravity.x + b->fx * b->invm) * DT * b->lockx;
     b->vy += (phys_gravity.y + b->fy * b->invm) * DT * b->locky;
     b->w += b->tq * b->invi * DT * b->lockr;
@@ -1307,7 +1375,7 @@ void phys_step(void) {
   /* integrate */
   for (int i = 0; i < nbodies; i++) {
     Body *b = &bodies[i];
-    if (b->obj < 0) continue;
+    if (b->obj < 0 || !(objs[b->obj].flags & OF_VISIBLE)) continue;
     b->x += (b->vx + b->pvx) * DT;
     b->y += (b->vy + b->pvy) * DT;
     b->a += (b->w + b->pw) * DT;
@@ -1366,6 +1434,7 @@ void phys_debug(int frame) {
   if (tr && nbodies && frame % (getenv("ND_T5") ? 5 : 10) == 0) {
     static float x0, y0;
     Body *b = &bodies[0];
+    if (getenv("ND_TOBJ") && body(atoi(getenv("ND_TOBJ")))) b = body(atoi(getenv("ND_TOBJ")));
     if (frame == 0) {
       x0 = b->x;
       y0 = b->y;
@@ -1374,7 +1443,7 @@ void phys_debug(int frame) {
     if (frame % 100 == 0) printf("\n");
     fflush(stdout);
   }
-  if (getenv("ND_JDBG") && frame >= 60 && frame < 130) {
+  if (getenv("ND_JDBG") && frame >= atoi(getenv("ND_JDBG")) && frame < atoi(getenv("ND_JDBG")) + 70) {
     printf("f%d", frame);
     for (int ji = 0; ji < njoints; ji++) {
       Joint *j = &joints[ji];

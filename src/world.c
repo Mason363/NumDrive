@@ -327,6 +327,23 @@ int shape_find(const Shape *s, int x, int y, int z) {
   return -1;
 }
 
+/* Fancade's position of a block in an object is the centre of that block's voxels (a thin plate
+   lying at the bottom of its block has its position near the bottom) */
+vec3 shape_block_center(const Shape *s, int x, int y, int z) {
+  int v0[3] = {8, 8, 8}, v1[3] = {-1, -1, -1};
+  for (int i = 0; i < s->np; i++) {
+    uint32_t k = s->key[i];
+    if (PK_X(k) != x || PK_Y(k) != y || PK_Z(k) != z) continue;
+    const uint8_t *bb = blocks[s->blk[i]]->bb + PK_C(k) * 6;
+    for (int a = 0; a < 3; a++) {
+      if (bb[a] < v0[a]) v0[a] = bb[a];
+      if (bb[a + 3] > v1[a]) v1[a] = bb[a + 3];
+    }
+  }
+  if (v1[0] < v0[0]) return v3(x + 0.5f, y + 0.5f, z + 0.5f);
+  return v3(x + (v0[0] + v1[0] + 1) / 16.0f, y + (v0[1] + v1[1] + 1) / 16.0f, z + (v0[2] + v1[2] + 1) / 16.0f);
+}
+
 static void shape_finish(Shape *s) {
   /* occlusion masks */
   for (int i = 0; i < s->np; i++) {
@@ -376,6 +393,7 @@ static void shape_finish(Shape *s) {
         s->origin = c;
       }
     }
+    s->origin = shape_block_center(s, (int)s->origin.x, (int)s->origin.y, (int)s->origin.z);
   }
   s->bmin = v3(bx0 / 8, by0 / 8, bz0 / 8);
   s->bmax = v3(bx1 / 8, by1 / 8, bz1 / 8);

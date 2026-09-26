@@ -22,6 +22,7 @@ void phys_set_gravity(vec3 g);
 void phys_moved(int o); /* object teleported by script */
 void phys_make_dynamic(int o);
 void phys_destroyed(int o);
+void phys_hidden(int o);
 
 int phys_add_constraint(int base, int part, vec3 pivot);
 void phys_con_limits(int c, bool angular, vec3 lower, vec3 upper);

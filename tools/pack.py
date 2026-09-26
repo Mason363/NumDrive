@@ -240,12 +240,13 @@ class Packer:
                 continue
             for r in n.ins:
                 body.u16(self.ref(r, selfmap))
+            # several wires from one output run in block order (node indices follow it)
             for tg in n.execs:
                 body.u8(len(tg))
-                for t in tg:
+                for t in sorted(tg):
                     body.u16(t)
             body.u8(len(n.after))
-            for t in n.after:
+            for t in sorted(n.after):
                 body.u16(t)
             d = n.data
             if d:

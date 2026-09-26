@@ -171,5 +171,6 @@ void obj_destroy(int id);
 
 /* find part index of cell (x,y,z) in shape (first component), or -1 */
 int shape_find(const Shape *s, int x, int y, int z);
+vec3 shape_block_center(const Shape *s, int x, int y, int z);
 
 #endif

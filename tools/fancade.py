@@ -110,6 +110,7 @@ def read_prefab(r):
     if has_blocks:
         p.size = (r.u16(), r.u16(), r.u16())
         n = p.size[0] * p.size[1] * p.size[2]
+        p.blocks_off = r.p
         p.blocks = list(struct.unpack_from('<%dH' % n, r.b, r.p))
         r.p += 2 * n
     p.settings = []
@@ -132,7 +133,9 @@ def read_prefab(r):
                 v = r.string()
             p.settings.append((idx, t, pos, v))
     p.conns = []
+    p.conns_off = None
     if has_conn:
+        p.conns_off = r.p + 2
         for _ in range(r.u16()):
             a = [r.u16() for _ in range(12)]
             p.conns.append((tuple(a[0:3]), tuple(a[3:6]), tuple(a[6:9]), tuple(a[9:12])))

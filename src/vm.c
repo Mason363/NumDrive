@@ -224,7 +224,7 @@ static void env_block_pose(Env *e, vec3 *pos, quat *rot) {
   vec3 rest = v3(e->bx + 0.5f, e->by + 0.5f, e->bz + 0.5f);
   if (e->anchor >= 0) {
     Obj *o = &objs[e->anchor];
-    *pos = obj_world(o, rest);
+    *pos = obj_world(o, shape_block_center(o->shape, e->bx, e->by, e->bz));
     *rot = o->rot;
   } else {
     *pos = rest;
@@ -475,7 +475,7 @@ static void eval_node(Env *e, int ni, int out, Val *r) {
       int o = -1;
       bool h = phys_raycast(from, to, &hit, &o);
 #ifdef HOST
-      if (getenv("ND_RDBG") && vm_frame_count < 1)
+      if (getenv("ND_RDBG") && vm_frame_count == atoi(getenv("ND_RDBG")))
         fprintf(stderr, "ray (%.2f %.2f %.2f)->(%.2f %.2f %.2f) hit=%d obj=%d at (%.2f %.2f %.2f)\n", from.x, from.y, from.z, to.x, to.y,
                 to.z, h, o, hit.x, hit.y, hit.z);
 #endif
@@ -533,20 +533,10 @@ static void eval_node(Env *e, int ni, int out, Val *r) {
         if (!obj_valid(o)) {
           mn = mx = v3(0, 0, 0);
         } else {
-          Obj *ob = &objs[o];
-          Shape *s = ob->shape;
-          mn = v3(1e9f, 1e9f, 1e9f);
-          mx = v3(-1e9f, -1e9f, -1e9f);
-          for (int c = 0; c < 8; c++) {
-            vec3 pt = v3(c & 1 ? s->bmax.x : s->bmin.x, c & 2 ? s->bmax.y : s->bmin.y, c & 4 ? s->bmax.z : s->bmin.z);
-            vec3 w = obj_world(ob, pt);
-            if (w.x < mn.x) mn.x = w.x;
-            if (w.y < mn.y) mn.y = w.y;
-            if (w.z < mn.z) mn.z = w.z;
-            if (w.x > mx.x) mx.x = w.x;
-            if (w.y > mx.y) mx.y = w.y;
-            if (w.z > mx.z) mx.z = w.z;
-          }
+          /* local bounds relative to the object's position, not rotated */
+          const Shape *s = objs[o].shape;
+          mn = vsub(s->bmin, s->origin);
+          mx = vsub(s->bmax, s->origin);
         }
       }
       r->t = T_VEC;
@@ -768,7 +758,10 @@ static void exec_stmt(Env *e, int ni) {
       int o = connected(nd, 0) ? in_obj(e, nd, 0) : e->anchor;
       if (!obj_valid(o)) return;
       if (in_tru(e, nd, 1)) objs[o].flags |= OF_VISIBLE;
-      else objs[o].flags &= ~OF_VISIBLE;
+      else if (objs[o].flags & OF_VISIBLE) {
+        objs[o].flags &= ~OF_VISIBLE;
+        phys_hidden(o);
+      }
       return;
     }
     case OP_CREATE_OBJECT: {
@@ -860,8 +853,9 @@ static void run_chain(Env *e, uint16_t node) {
     exec_stmt(e, node);
     const uint8_t *after = node_exec(node_ptr(e->prog, node), -1);
     if (after[0] == 0) return;
-    for (int i = 1; i < after[0]; i++) run_chain(e, rd16(after + 1 + 2 * i));
-    node = rd16(after + 1);
+    /* several wires from one output run one after the other, in block order */
+    for (int i = 0; i + 1 < after[0]; i++) run_chain(e, rd16(after + 1 + 2 * i));
+    node = rd16(after + 1 + 2 * (after[0] - 1));
   }
 }
 

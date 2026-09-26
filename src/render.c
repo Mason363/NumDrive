@@ -394,6 +394,11 @@ bool render_init_level(void) {
   r = r + (255 - r) * 2 / 5;
   g = g + (255 - g) * 2 / 5;
   b = b + (255 - b) * 2 / 5;
+  /* the background of the levels built on Fancade's floor, as seen in the original */
+  static const uint8_t floor_bg[][4] = {
+      {2, 63, 63, 77}, {4, 132, 135, 153}, {5, 172, 175, 191}, {7, 89, 58, 73}, {8, 150, 87, 102}, {22, 18, 114, 76}};
+  for (unsigned i = 0; i < sizeof floor_bg / sizeof floor_bg[0]; i++)
+    if (floor_bg[i][0] == level.bg) r = floor_bg[i][1], g = floor_bg[i][2], b = floor_bg[i][3];
   sky565 = rgb565(r, g, b);
   return true;
 }
@@ -427,7 +432,7 @@ static bool obj_screen_bounds(const Obj *o, int *y0, int *y1, int *x0, int *x1) 
 #define MAX_CASTERS 32
 #define SHADOW_TOL 40 /* depth units */
 static struct {
-  int16_t obj;
+  int16_t obj, floor;
   float ground;
 } casters[MAX_CASTERS];
 static int ncasters;
@@ -435,6 +440,7 @@ static uint8_t smask[SCREEN_W * STRIP_H / 8];
 typedef struct {
   float X, Y, ux, uy, vx, vy, z;
   int16_t y0, y1;
+  uint8_t floor; /* on Fancade's floor: also darkens the background */
 } SQuad;
 static SQuad *squads; /* projected shadow faces for this frame (scratch) */
 static int nsquads, squad_cap;
@@ -470,15 +476,21 @@ static void find_casters(void) {
       const Shape *s = o->shape;
       vec3 from = obj_world(o, vscale(vadd(s->bmin, s->bmax), 0.5f)), hit;
       int ho;
-      if (!phys_raycast_ex(from, v3(from.x, from.y - 12, from.z), &hit, &ho, i)) continue;
+      bool fl = false;
+      if (!phys_raycast_ex(from, v3(from.x, from.y - 12, from.z), &hit, &ho, i)) {
+        if (from.y > 12 || from.y < 0) continue;
+        hit.y = 0; /* Fancade's floor */
+        fl = true;
+      }
       casters[ncasters].obj = (int16_t)i;
+      casters[ncasters].floor = fl;
       casters[ncasters].ground = hit.y;
       ncasters++;
     }
 }
 
 /* mark pixels of the parallelogram whose stored depth matches the plane */
-static void raster_mark(float X0, float Y0, float ux, float uy, float vx, float vy, float z0) {
+static void raster_mark(float X0, float Y0, float ux, float uy, float vx, float vy, float z0, bool floor) {
   float det = ux * vy - uy * vx;
   if (fabsf(det) < 1e-3f) return;
   float id = 1.0f / det;
@@ -538,14 +550,14 @@ static void raster_mark(float X0, float Y0, float ux, float uy, float vx, float 
     const uint16_t *zp = zbuf + row;
     for (int x = x0; x < x1; x++, zs += dz) {
       int d = (int)zs - zp[x];
-      if (d <= SHADOW_TOL && d >= -SHADOW_TOL) smask[(row + x) >> 3] |= (uint8_t)(1 << ((row + x) & 7));
+      if ((d <= SHADOW_TOL && d >= -SHADOW_TOL) || (floor && zp[x] == 0xFFFF)) smask[(row + x) >> 3] |= (uint8_t)(1 << ((row + x) & 7));
     }
     sh_any = true;
   }
 }
 
 /* project a lit face (corner p, edges u, v in world space) onto the plane y = g */
-static void shadow_face(vec3 p, vec3 u, vec3 v, float g, vec3 d) {
+static void shadow_face(vec3 p, vec3 u, vec3 v, float g, vec3 d, bool floor) {
   float k = (g - p.y) / d.y;
   if (k < 0 || nsquads >= squad_cap) return; /* face below the ground plane */
   vec3 p0 = vadd(p, vscale(d, k));
@@ -563,6 +575,7 @@ static void shadow_face(vec3 p, vec3 u, vec3 v, float g, vec3 d) {
   if (ymax < 0 || ymin > SCREEN_H) return;
   sq->y0 = (int16_t)(ymin - 1);
   sq->y1 = (int16_t)(ymax + 1);
+  sq->floor = floor;
   nsquads++;
 }
 
@@ -606,7 +619,7 @@ static void build_shadows(void) {
           if (!lit[f]) continue;
           int a = f >> 1, ua = a == 0 ? 1 : 0, va = a == 2 ? 1 : 2;
           vec3 p = (f & 1) ? p0 : vadd(p0, e[a]);
-          shadow_face(p, e[ua], e[va], g, d);
+          shadow_face(p, e[ua], e[va], g, d, casters[c].floor);
         }
       }
     }
@@ -620,7 +633,7 @@ static void draw_shadows(void) {
   for (int i = 0; i < nsquads; i++) {
     const SQuad *q = &squads[i];
     if (q->y1 < strip_y0 || q->y0 >= strip_y1) continue;
-    raster_mark(q->X, q->Y, q->ux, q->uy, q->vx, q->vy, q->z);
+    raster_mark(q->X, q->Y, q->ux, q->uy, q->vx, q->vy, q->z, q->floor);
   }
   if (!sh_any) return;
   int n = (strip_y1 - strip_y0) * SCREEN_W;
