@@ -104,7 +104,8 @@ static bool ray_box(vec3 o, vec3 d, vec3 mn, vec3 mx, float *tin) {
       if (t0 > t1) return false;
     }
   }
-  if (t1 < 0 || t0 < 0) return false;
+  /* a ray starting inside a box, or on its surface, does not hit it */
+  if (t1 < 0 || t0 <= 1e-5f) return false;
   *tin = t0;
   return true;
 }
