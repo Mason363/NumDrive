@@ -1,0 +1,52 @@
+name: Build and release
+
+# Every push to main publishes the release named in VERSION (or the pushed v* tag); pull requests only build.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y gcc-arm-none-eabi libnewlib-arm-none-eabi
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Build
+        run: |
+          make
+          cp output/device/drivemad.nwa DriveMad.nwa
+      - name: Check RAM
+        run: |
+          used=$(arm-none-eabi-size -A output/device/drivemad.nwa | awk '/^\.(data|bss)/ {s+=$2} END {print s}')
+          echo "RAM used: $used of 153676 bytes"
+          test "$used" -le 153676
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DriveMad
+          path: DriveMad.nwa
+      - name: Release tag
+        id: tag
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then tag="$GITHUB_REF_NAME"; else tag="v$(cat VERSION)"; fi
+          echo "name=$tag" >> "$GITHUB_OUTPUT"
+      - name: Publish release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: DriveMad.nwa
+          tag_name: ${{ steps.tag.outputs.name }}
+          target_commitish: ${{ github.sha }}
+          name: Drive Mad ${{ steps.tag.outputs.name }}
+          body: |
+            Drive Mad for the NumWorks N0120 calculator.
+            Install DriveMad.nwa from https://my.numworks.com/apps
