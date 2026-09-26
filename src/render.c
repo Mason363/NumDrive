@@ -139,6 +139,11 @@ typedef struct {
   float dsdx, dsdy, dtdx, dtdy, isx, itx;
 } PInv;
 
+/* Fancade's floor, an endless plane at y = 0, hides whatever is below it: while an object reaching below it is
+ * drawn, world y at a pixel is fl_k + fl_x * x + fl_y * y + fl_z * depth */
+static bool fl_on;
+static float fl_k, fl_x, fl_y, fl_z;
+
 static void raster(float X0, float Y0, float ux, float uy, float vx, float vy, const PInv *pi, float z0, float zx,
                    float zy, uint16_t color) {
   float ymin = Y0, ymax = Y0;
@@ -184,8 +189,21 @@ static void raster(float X0, float Y0, float ux, float uy, float vx, float vy, c
     int x0 = iceil(X0 + xl - 0.5f), x1 = iceil(X0 + xr - 0.5f);
     if (x0 < clip_x0) x0 = clip_x0;
     if (x1 > clip_x1) x1 = clip_x1;
-    if (x0 >= x1) continue;
     float yc = y + 0.5f;
+    if (fl_on) {
+      /* world y along the row: a + b * (pixel centre x) */
+      float a = fl_k + fl_y * yc + fl_z * (z0 - zx * X0 + zy * (yc - Y0)), b = fl_x + fl_z * zx, e = -0.01f - a;
+      if (b > 1e-7f) {
+        int xa = iceil(e / b - 0.5f);
+        if (xa > x0) x0 = xa;
+      } else if (b < -1e-7f) {
+        int xb = iceil(e / b - 0.5f);
+        if (xb < x1) x1 = xb;
+      } else if (e > 0) {
+        continue;
+      }
+    }
+    if (x0 >= x1) continue;
     float zs = zbase + (zx * (x0 + 0.5f) + zy * yc) * ZSCALE;
     if (zs < 0) zs = 0;
     int32_t z = (int32_t)(zs * 256.0f);
@@ -244,6 +262,16 @@ static void setup_xf(const Obj *o) {
   xf.ox = cam.cx + vdot(d, cam.right) * cam.scale;
   xf.oy = cam.cy - vdot(d, cam.up) * cam.scale;
   xf.oz = vdot(d, cam.fwd);
+  {
+    vec3 lo = vsub(s->bmin, s->origin), hi = vsub(s->bmax, s->origin);
+    vec3 m = v3(fmaxf(-lo.x, hi.x), fmaxf(-lo.y, hi.y), fmaxf(-lo.z, hi.z));
+    fl_on = o->pos.y * o->pos.y < vdot(m, m) || o->pos.y < 0;
+    vec3 f = vadd(cam.focus, cam.shake);
+    fl_x = cam.right.y / cam.scale;
+    fl_y = -cam.up.y / cam.scale;
+    fl_z = cam.fwd.y;
+    fl_k = f.y - fl_x * cam.cx - fl_y * cam.cy;
+  }
   xf.vis = 0;
   for (int f = 0; f < 6; f++) {
     vec3 n = vscale(ax[f >> 1], (f & 1) ? -1.0f : 1.0f);
@@ -382,6 +410,7 @@ static void draw_object(Obj *ob, RObj *o) {
   } else {
     for (int i = 0; i < s->np; i++) draw_part(s, i);
   }
+  fl_on = false;
 }
 
 /* ------------------------------------------------------------------ frame */
