@@ -118,7 +118,7 @@ int main(int argc, char **argv) {
   }
   int state = ST_PLAY, kind = CARD_PAUSE, anim = 0, sel = 1, lsel = 0, lscroll = 0;
   bool dirty = true;
-  uint64_t prev = 0;
+  uint64_t prev = plat_keys();
   uint32_t last = plat_millis();
   int acc = 0;
   for (;;) {
