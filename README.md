@@ -2,7 +2,7 @@
 
 Drive Mad, the Fancade driving game, on the NumWorks N0120 calculator.
 
-196 of the 200 levels, the same cars, physics puzzles, bridges, water and look as the original.
+157 levels from the original, with the same cars, physics puzzles, bridges, water and look.
 
 <p align="center">
   <img src="docs/shot1.png" width="320"> <img src="docs/shot2.png" width="320">

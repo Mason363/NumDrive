@@ -11,8 +11,11 @@ import ops
 from deflate import raw_deflate, zop
 from fancade import Game, LEVEL, PHYSICS, SCRIPT
 
-# levels left out: their mechanics need parts turning out of the 2D plane (or they cannot be won here)
-SKIP = {115, 144, 158, 173}
+# levels left out: parts turning out of the 2D plane (115, 144, 158, 173), too heavy to draw (128), or no
+# win found by the host win search
+SKIP = {115, 144, 158, 173, 128,
+        16, 19, 25, 35, 42, 45, 48, 53, 56, 58, 59, 64, 66, 67, 69, 81, 85, 93, 97, 103, 104, 112, 122, 127,
+        132, 137, 141, 146, 150, 154, 155, 169, 172, 180, 183, 190, 196, 198}
 from model import BlockLib, build_objects, grid_cells, DIRS, vidx
 from scriptc import Compiler, custom_terminals
 

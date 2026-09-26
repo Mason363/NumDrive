@@ -6,4 +6,4 @@ one() {
   echo "$1 $r"
 }
 if [ -n "$1" ]; then one "$1"; exit; fi
-seq 0 $((${NLEVELS:-196} - 1)) | xargs -P 8 -I{} "$0" {} | sort -n
+seq 0 $((${NLEVELS:-157} - 1)) | xargs -P 8 -I{} "$0" {} | sort -n
