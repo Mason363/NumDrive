@@ -444,6 +444,12 @@ typedef struct {
 } SQuad;
 static SQuad *squads; /* projected shadow faces for this frame (scratch) */
 static int nsquads, squad_cap;
+#ifdef HOST
+#include <stdio.h>
+#include <stdlib.h>
+static int st_sq_max, st_sq_drop, st_sq_cap = 1 << 30;
+static void sq_dump(void) { printf("SQUADS max %d dropped %d mincap %d\n", st_sq_max, st_sq_drop, st_sq_cap); }
+#endif
 static float sh_zx, sh_zy; /* screen depth gradient of a horizontal plane */
 static bool sh_any;
 
@@ -559,6 +565,9 @@ static void raster_mark(float X0, float Y0, float ux, float uy, float vx, float 
 /* project a lit face (corner p, edges u, v in world space) onto the plane y = g */
 static void shadow_face(vec3 p, vec3 u, vec3 v, float g, vec3 d, bool floor) {
   float k = (g - p.y) / d.y;
+#ifdef HOST
+  if (k >= 0 && nsquads >= squad_cap) st_sq_drop++;
+#endif
   if (k < 0 || nsquads >= squad_cap) return; /* face below the ground plane */
   vec3 p0 = vadd(p, vscale(d, k));
   vec3 u0 = vsub(u, vscale(d, u.y / d.y)), v0 = vsub(v, vscale(d, v.y / d.y));
@@ -581,6 +590,9 @@ static void shadow_face(vec3 p, vec3 u, vec3 v, float g, vec3 d, bool floor) {
 
 /* project the shadows of all casters once per frame */
 static void build_shadows(void) {
+#ifdef HOST
+  if (nsquads > st_sq_max) st_sq_max = nsquads;
+#endif
   nsquads = 0;
   if (!ncasters) return;
   vec3 d = vscale(light_to, -1);
@@ -595,6 +607,7 @@ static void build_shadows(void) {
       uint32_t k = s->key[i];
       const Block *b = blocks[s->blk[i]];
       int comp = PK_C(k);
+      uint8_t occ = s->occ ? s->occ[i] : 0;
       /* use the collision boxes, or the component bounds when the block has none */
       int nb = b->nbox;
       for (int j = 0; j < (nb ? nb : 1); j++) {
@@ -618,6 +631,8 @@ static void build_shadows(void) {
         for (int f = 0; f < 6; f++) {
           if (!lit[f]) continue;
           int a = f >> 1, ua = a == 0 ? 1 : 0, va = a == 2 ? 1 : 2;
+          /* a face against a full face of the same object adds nothing to its shadow */
+          if ((occ >> f & 1) && ((f & 1) ? lo[a] == 0 : hi[a] == 8)) continue;
           vec3 p = (f & 1) ? p0 : vadd(p0, e[a]);
           shadow_face(p, e[ua], e[va], g, d, casters[c].floor);
         }
@@ -655,6 +670,13 @@ void render_prepare(int rx0, int rx1) {
   squads = (SQuad *)scr;
   squad_cap = (int)((avail / 3) / sizeof(SQuad)); /* at most a third of the free space */
   if (squad_cap > 512) squad_cap = 512;
+#ifdef HOST
+  {
+    static int reg;
+    if (!reg++ && getenv("ND_STATS")) atexit(sq_dump);
+    if (squad_cap < st_sq_cap) st_sq_cap = squad_cap;
+  }
+#endif
   uint32_t used = (uint32_t)squad_cap * sizeof(SQuad);
   pc_base = scr + used;
   pc_avail = avail - used;

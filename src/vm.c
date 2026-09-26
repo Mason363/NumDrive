@@ -13,9 +13,11 @@
 
 typedef struct {
   uint8_t type;
-  uint16_t len, cap;
+  uint8_t cap2; /* capacity: 0, or 1 << (cap2 - 1) elements */
+  uint16_t len;
   uint8_t *data;
 } VarStore;
+#define VS_CAP(vs) ((vs)->cap2 ? 1 << ((vs)->cap2 - 1) : 0)
 
 typedef struct {
   VarStore *vs;
@@ -123,20 +125,64 @@ static void var_read(VarStore *vs, int idx, Val *out) {
   }
 }
 
+/* list storage given up when a list grows elsewhere, reused by later growth (the arena never frees) */
+#define NFREE 32
+static struct {
+  uint8_t *p;
+  uint32_t n;
+} freeblk[NFREE];
+static int nfree;
+
+static void give_back(uint8_t *p, uint32_t n) {
+  n = (n + 7) & ~7u;
+  if (!p || !n || arena_release_top(p, n)) return;
+  int k = nfree;
+  if (nfree == NFREE) { /* full: replace the smallest if this one is bigger */
+    k = 0;
+    for (int i = 1; i < NFREE; i++)
+      if (freeblk[i].n < freeblk[k].n) k = i;
+    if (freeblk[k].n >= n) return;
+  } else {
+    nfree++;
+  }
+  freeblk[k].p = p;
+  freeblk[k].n = n;
+}
+
+static uint8_t *list_alloc(uint32_t n) {
+  n = (n + 7) & ~7u;
+  int best = -1;
+  for (int i = 0; i < nfree; i++)
+    if (freeblk[i].n >= n && (best < 0 || freeblk[i].n < freeblk[best].n)) best = i;
+  if (best < 0) return arena_alloc(n);
+  uint8_t *p = freeblk[best].p;
+  uint32_t rest = freeblk[best].n - n;
+  if (rest >= 16) {
+    freeblk[best].p = p + n;
+    freeblk[best].n = rest;
+  } else {
+    freeblk[best] = freeblk[--nfree];
+  }
+  return p;
+}
+
 static void var_write(VarStore *vs, int idx, const Val *v) {
   if (idx < 0 || idx >= 4096) return;
   int es = esize[vs->type];
-  if (idx >= vs->cap) {
-    int nc = vs->cap ? vs->cap : 1;
-    while (nc <= idx) nc *= 2;
-    if (vs->data && arena_extend(vs->data, vs->cap * es, nc * es)) {
-      vs->cap = nc;
+  int cap = VS_CAP(vs);
+  if (idx >= cap) {
+    int c2 = vs->cap2 ? vs->cap2 : 1;
+    while ((1 << (c2 - 1)) <= idx) c2++;
+    int nc = 1 << (c2 - 1);
+    if (vs->data && arena_extend(vs->data, cap * es, nc * es)) {
+      vs->cap2 = (uint8_t)c2;
     } else {
-      uint8_t *nd = arena_alloc(nc * es);
+      uint8_t *nd = list_alloc(nc * es);
       if (!nd) return;
       if (vs->len) memcpy(nd, vs->data, vs->len * es);
+      give_back(vs->data, cap * es);
       vs->data = nd;
-      vs->cap = nc;
+      vs->cap2 = (uint8_t)c2;
     }
   }
   while (vs->len <= idx) {
@@ -501,8 +547,8 @@ static void eval_node(Env *e, int ni, int out, Val *r) {
 #ifdef HOST
       if (getenv("ND_RDBG") && (vm_frame_count == atoi(getenv("ND_RDBG")) || atoi(getenv("ND_RDBG")) < 0))
       {
-        fprintf(stderr, "ray (%.2f %.2f %.2f)->(%.2f %.2f %.2f) hit=%d obj=%d at (%.2f %.2f %.2f)\n", from.x, from.y, from.z, to.x, to.y,
-                to.z, h, o, hit.x, hit.y, hit.z);
+        fprintf(stderr, "ray (%.2f %.2f %.2f)->(%.2f %.2f %.2f) hit=%d obj=%d at (%.2f %.2f %.2f) f%d\n", from.x, from.y, from.z, to.x, to.y,
+                to.z, h, o, hit.x, hit.y, hit.z, vm_frame_count);
         if (getenv("ND_RDBG2") && fabsf(from.x - atof(getenv("ND_RDBG2"))) < 0.01f)
           for (int q = 0; q < nobj; q++) {
             vec3 l = obj_local(&objs[q], from), l2 = obj_local(&objs[q], to);
@@ -959,7 +1005,7 @@ static bool make_env(Prog *p, int parent, int pnode, int bx, int by, int bz) {
   if (!e->locals) return false;
   for (int k = 0; k < p->nlocals; k++) {
     e->locals[k].type = p->ltypes[k];
-    e->locals[k].len = e->locals[k].cap = 0;
+    e->locals[k].len = e->locals[k].cap2 = 0;
     e->locals[k].data = 0;
   }
   if (p->nslots) {
@@ -978,13 +1024,14 @@ static bool make_env(Prog *p, int parent, int pnode, int bx, int by, int bz) {
 }
 
 bool vm_setup_envs(void) {
+  nfree = 0;
   int n = count_envs(level.prog);
   envs = arena_alloc(sizeof(Env) * n);
   globals = arena_alloc(sizeof(VarStore) * (nglobals ? nglobals : 1));
   if (!envs || !globals) return false;
   for (int i = 0; i < nglobals; i++) {
     globals[i].type = global_types[i];
-    globals[i].len = globals[i].cap = 0;
+    globals[i].len = globals[i].cap2 = 0;
     globals[i].data = 0;
   }
   nenvs = 0;

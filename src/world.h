@@ -23,11 +23,14 @@ void *arena_alloc_dbg(uint32_t size, const char *f, int l);
 void arena_reset(void);
 void *arena_tmp_alloc(uint32_t size); /* setup-only data, freed after the level is instantiated */
 void arena_tmp_reset(void);
+uint32_t arena_tmp_mark(void);
+void arena_tmp_release(uint32_t m);
 void *arena_keep_alloc(uint32_t size); /* after setup: allocation kept until the next level */
 extern int level_serial;
 uint32_t arena_used(void);
 uint32_t arena_mark(void);
 void arena_release(uint32_t mark);
+bool arena_release_top(void *p, uint32_t size); /* frees p if it is the last allocation */
 bool arena_extend(void *p, uint32_t old_size, uint32_t new_size); /* grow the last allocation in place */
 void *arena_top(uint32_t *avail); /* scratch space at the top of the arena */
 
@@ -42,27 +45,15 @@ typedef struct {
   uint8_t ncomp;
   uint8_t full;   /* 6 bits: face fully covered */
   uint8_t nbox;
-  const uint8_t *solid; /* 64 bytes */
-  const uint8_t *comp;  /* 256 nibbles, or NULL when single component */
-  const uint8_t *glue;  /* ncomp * 6 * 8 bytes */
   const uint8_t *boxes; /* nbox * 3 */
   const uint8_t *fq[6]; /* quads per face, 3 bytes each */
   uint8_t nq[6];
   /* per component stats (voxel units) */
   uint16_t *cnt;
-  float *sum;  /* ncomp * 3 */
+  float *sum;  /* ncomp * 3: sums of voxel centres */
+  float *mom;  /* ncomp * 6: sums of xx, yy, zz, xy, xz, yz of voxel centres */
   uint8_t *bb; /* ncomp * 6: min xyz, max xyz (inclusive) */
 } Block;
-
-static inline int blk_solid(const Block *b, int x, int y, int z) {
-  int i = x + y * 8 + z * 64;
-  return (b->solid[i >> 3] >> (i & 7)) & 1;
-}
-static inline int blk_comp(const Block *b, int x, int y, int z) {
-  if (!b->comp) return 0;
-  int i = x + y * 8 + z * 64;
-  return (b->comp[i >> 1] >> ((i & 1) * 4)) & 15;
-}
 
 extern Block *blocks[256]; /* loaded blocks by library index (NULL if unused) */
 
@@ -96,12 +87,21 @@ typedef struct {
   Shape *shape;
   vec3 pos; /* world position of the shape origin */
   quat rot;
-  float friction, bounce, mass;
-  uint16_t flags;
+  float mass;
+  uint8_t flags;
+  uint8_t mat;          /* friction and bounciness (index into mat_tab) */
   uint16_t src;         /* object this was cloned from (or itself) */
   int16_t body;         /* physics body index or -1 */
   uint8_t lockp, lockr; /* allowed axes bits (x=1,y=2,z=4) for position / rotation */
 } Obj;
+
+/* the distinct friction / bounciness pairs of the level's objects */
+#define NMAT 32
+extern float mat_tab[NMAT][2];
+extern int nmat;
+static inline float obj_friction(const Obj *o) { return mat_tab[o->mat][0]; }
+static inline float obj_bounce(const Obj *o) { return mat_tab[o->mat][1]; }
+uint8_t mat_find(float friction, float bounce);
 
 extern Obj *objs;
 extern int obj_cap;
@@ -122,7 +122,7 @@ typedef struct Prog {
   uint8_t yc; /* model centre height of a script block, in 1/16 */
   uint16_t rec;
   uint16_t nnodes;
-  uint16_t *off;        /* node offsets into data */
+  const uint16_t *off;  /* node offsets into data */
   const uint8_t *data;  /* node records */
   uint16_t nentries;
   const uint8_t *entries;
@@ -134,7 +134,7 @@ typedef struct Prog {
   const uint8_t *selfvox;
   uint16_t ntmpl;       /* template shapes formed from the inner grid */
   Shape **tmpl;
-  uint16_t *slot;       /* per node output slot (or NONE16) */
+  const uint16_t *slot; /* per node output slot (or NONE16) */
   uint16_t nslots;
   const uint8_t *objdata; /* template objects (see scan_objects) */
 } Prog;

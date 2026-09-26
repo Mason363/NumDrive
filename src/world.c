@@ -15,7 +15,7 @@ extern const uint8_t pack_data[];
 
 /* ------------------------------------------------------------------ arena */
 #ifndef ARENA_SIZE
-#define ARENA_SIZE (121 * 1024)
+#define ARENA_SIZE (122 * 1024)
 #endif
 static uint8_t arena[ARENA_SIZE] __attribute__((aligned(8)));
 /* persistent data grows up from the bottom; the object table sits at the very top (arena_hi) and
@@ -47,6 +47,8 @@ void *arena_tmp_alloc(uint32_t size) {
   return arena + arena_tmp;
 }
 void arena_tmp_reset(void) { arena_tmp = arena_hi; }
+uint32_t arena_tmp_mark(void) { return arena_tmp; }
+void arena_tmp_release(uint32_t m) { arena_tmp = m; }
 static void *arena_high_alloc(uint32_t size) {
   size = (size + 7) & ~7u;
   if (arena_tmp < arena_pos + size || arena_tmp != arena_hi) return 0;
@@ -71,8 +73,30 @@ void arena_reset(void) {
 #include <stdio.h>
 static struct { const char *f; int l; uint32_t n; } prof[64];
 static int nprof;
+/* live allocations (bump order) and a snapshot of them at the peak */
+static struct { uint32_t off, n; const char *f; int l; } live[8192];
+static int nlive;
+static char peak_snap[4096];
+static uint32_t snap_peak;
 static void prof_dump(void) {
   for (int i = 0; i < nprof; i++) printf("PROF %s:%d %u\n", prof[i].f, prof[i].l, prof[i].n);
+  printf("PEAK %u\n%s", snap_peak, peak_snap);
+}
+static void prof_snapshot(void) {
+  uint32_t used = arena_pos + (ARENA_SIZE - arena_tmp);
+  if (used <= snap_peak) return;
+  snap_peak = used;
+  int n = snprintf(peak_snap, sizeof peak_snap, "  pos %u tmp %u\n", arena_pos, ARENA_SIZE - arena_tmp);
+  for (int i = 0; i < nlive && n < (int)sizeof peak_snap - 64; i++) {
+    bool seen = false;
+    for (int k = 0; k < i && !seen; k++) seen = live[k].l == live[i].l && live[k].f == live[i].f;
+    if (seen) continue;
+    uint32_t tot = 0;
+    int cnt = 0;
+    for (int j = i; j < nlive; j++)
+      if (live[j].l == live[i].l && live[j].f == live[i].f) tot += live[j].n, cnt++;
+    n += snprintf(peak_snap + n, sizeof peak_snap - n, "  %s:%d x%d %u\n", live[i].f, live[i].l, cnt, tot);
+  }
 }
 void *arena_alloc_dbg(uint32_t size, const char *f, int l) {
   if (!nprof) atexit(prof_dump);
@@ -81,13 +105,25 @@ void *arena_alloc_dbg(uint32_t size, const char *f, int l) {
     if (prof[i].l == l && prof[i].f == f) break;
   if (i == nprof && nprof < 64) prof[nprof++] = (typeof(prof[0])){f, l, 0};
   if (i < 64) prof[i].n += (size + 7) & ~7u;
-  return arena_alloc(size);
+  while (nlive && live[nlive - 1].off >= arena_pos) nlive--;
+  uint32_t off = arena_pos;
+  void *p = arena_alloc(size);
+  if (p && nlive < 8192) live[nlive++] = (typeof(live[0])){off, (size + 7) & ~7u, f, l};
+  prof_snapshot();
+  return p;
 }
 #define arena_alloc(n) arena_alloc_dbg((n), __FILE__, __LINE__)
 #endif
 uint32_t arena_used(void) { return arena_pos; }
+uint32_t arena_free(void) { return arena_tmp - arena_pos; }
 uint32_t arena_mark(void) { return arena_pos; }
 void arena_release(uint32_t m) { arena_pos = m; }
+bool arena_release_top(void *p, uint32_t size) {
+  size = (size + 7) & ~7u;
+  if ((uint8_t *)p + size != arena + arena_pos) return false;
+  arena_pos -= size;
+  return true;
+}
 bool arena_extend(void *p, uint32_t old_size, uint32_t new_size) {
   old_size = (old_size + 7) & ~7u;
   new_size = (new_size + 7) & ~7u;
@@ -147,7 +183,7 @@ static const uint8_t *load_rec(int rec) {
 uint16_t nglobals;
 const uint8_t *global_types;
 int nlevels;
-static uint16_t level_rec[200], level_nm[200];
+static const uint8_t *level_dir; /* per level: u16 record, name (u8 length + chars) */
 static uint16_t nblocklib, block_group, block_rec0;
 static const uint8_t *dir_buf; /* the directory record is stored uncompressed */
 
@@ -164,18 +200,19 @@ bool world_init(void) {
   global_types = p;
   p += nglobals;
   nlevels = rd16(p);
-  p += 2;
-  for (int i = 0; i < nlevels; i++) {
-    level_rec[i] = rd16(p);
-    level_nm[i] = (uint16_t)(p + 2 - dir_buf);
-    p += 3 + p[2];
-  }
+  level_dir = p + 2;
   return true;
+}
+
+static const uint8_t *level_entry(int i) {
+  const uint8_t *p = level_dir;
+  while (i-- > 0) p += 3 + p[2];
+  return p;
 }
 
 const char *level_name(int i) {
   static char buf[24];
-  const uint8_t *q = dir_buf + level_nm[i];
+  const uint8_t *q = level_entry(i) + 2;
   int l = q[0] < 23 ? q[0] : 23;
   memcpy(buf, q + 1, l);
   buf[l] = 0;
@@ -186,30 +223,13 @@ const char *level_name(int i) {
 Block *blocks[256];
 static uint8_t need_blk[256];
 
-static const uint8_t *parse_block(const uint8_t *p, Block *b) {
-  b->flags = p[0];
-  b->ncomp = p[1];
-  p += 2;
-  b->solid = p;
-  p += 64;
-  b->comp = 0;
-  if (b->ncomp > 1) {
-    b->comp = p;
-    p += 256;
-  }
-  b->nbox = p[0];
-  b->boxes = p + 1;
-  p += 1 + 3 * b->nbox;
-  b->glue = p;
-  p += 48 * b->ncomp;
-  b->full = p[0];
-  p++;
-  for (int f = 0; f < 6; f++) {
-    b->nq[f] = p[0];
-    b->fq[f] = p + 1;
-    p += 1 + 3 * b->nq[f];
-  }
-  return p;
+/* block record: u8 flags, u8 ncomp, per component (u16 voxel count, f32 sums[3], f32 moments[6], u8 bounds[6]),
+ * then the part kept in RAM: u8 nbox, boxes (3 bytes each), u8 full faces, per face u8 count and quads (3 bytes) */
+#define COMP_STATS 44
+static uint32_t block_tail(const uint8_t *t) {
+  const uint8_t *p = t + 1 + 3 * t[0] + 1;
+  for (int f = 0; f < 6; f++) p += 1 + 3 * p[0];
+  return (uint32_t)(p - t);
 }
 
 static bool load_blocks(void) {
@@ -220,66 +240,48 @@ static bool load_blocks(void) {
     if (!any) continue;
     int rec = block_rec0 + g0 / block_group;
     uint32_t n = pack_rawsize(rec);
-    uint32_t mark = arena_mark();
-    uint8_t *base = arena_alloc(n);
+    uint32_t tm = arena_tmp_mark();
+    uint8_t *base = arena_tmp_alloc(n);
     if (!base || pack_load(rec, base, n) != (int)n) FAIL("load_blocks");
-    /* compact: keep only needed block records at the start of base */
     const uint8_t *p = base;
-    uint32_t keep = 0;
     for (int i = g0; i < g0 + block_group && i < nblocklib; i++) {
-      Block tb;
-      const uint8_t *next = parse_block(p, &tb);
-      uint32_t sz = (uint32_t)(next - p);
+      int ncomp = p[1];
+      const uint8_t *st = p + 2, *t = st + COMP_STATS * ncomp;
+      uint32_t tl = block_tail(t);
       if (need_blk[i] && !blocks[i]) {
-        memmove(base + keep, p, sz);
-        keep += sz;
-      }
-      p = next;
-    }
-    arena_release(mark);
-    arena_alloc(keep);
-    const uint8_t *q = base;
-    for (int i = g0; i < g0 + block_group && i < nblocklib; i++) {
-      if (need_blk[i] && !blocks[i]) {
-        Block *bk = arena_alloc(sizeof(Block));
-        if (!bk) FAIL("load_blocks");
-        memset(bk, 0, sizeof *bk);
-        q = parse_block(q, bk);
-        blocks[i] = bk;
-      }
-    }
-  }
-  /* per-block component statistics */
-  for (int i = 0; i < 256; i++) {
-    Block *b = blocks[i];
-    if (!b || b->cnt) continue;
-    b->cnt = arena_alloc(2 * b->ncomp);
-    b->sum = arena_alloc(12 * b->ncomp);
-    b->bb = arena_alloc(6 * b->ncomp);
-    if (!b->cnt || !b->sum || !b->bb) FAIL("load_blocks");
-    for (int c = 0; c < b->ncomp; c++) {
-      b->cnt[c] = 0;
-      b->sum[c * 3] = b->sum[c * 3 + 1] = b->sum[c * 3 + 2] = 0;
-      b->bb[c * 6] = b->bb[c * 6 + 1] = b->bb[c * 6 + 2] = 8;
-      b->bb[c * 6 + 3] = b->bb[c * 6 + 4] = b->bb[c * 6 + 5] = 0;
-    }
-    for (int z = 0; z < 8; z++)
-      for (int y = 0; y < 8; y++)
-        for (int x = 0; x < 8; x++) {
-          if (!blk_solid(b, x, y, z)) continue;
-          int c = blk_comp(b, x, y, z);
-          b->cnt[c]++;
-          b->sum[c * 3] += x + 0.5f;
-          b->sum[c * 3 + 1] += y + 0.5f;
-          b->sum[c * 3 + 2] += z + 0.5f;
-          uint8_t *bb = b->bb + c * 6;
-          if (x < bb[0]) bb[0] = x;
-          if (y < bb[1]) bb[1] = y;
-          if (z < bb[2]) bb[2] = z;
-          if (x > bb[3]) bb[3] = x;
-          if (y > bb[4]) bb[4] = y;
-          if (z > bb[5]) bb[5] = z;
+        Block *b = arena_alloc(sizeof(Block));
+        uint8_t *keep = arena_alloc(tl);
+        if (!b || !keep) FAIL("load_blocks");
+        memset(b, 0, sizeof *b);
+        b->flags = p[0];
+        b->ncomp = (uint8_t)ncomp;
+        b->cnt = arena_alloc(2 * ncomp);
+        b->sum = arena_alloc(12 * ncomp);
+        b->mom = arena_alloc(24 * ncomp);
+        b->bb = arena_alloc(6 * ncomp);
+        if (!b->cnt || !b->sum || !b->mom || !b->bb) FAIL("load_blocks");
+        for (int c = 0; c < ncomp; c++) {
+          const uint8_t *q = st + COMP_STATS * c;
+          b->cnt[c] = rd16(q);
+          for (int k = 0; k < 3; k++) b->sum[c * 3 + k] = rdf(q + 2 + 4 * k);
+          for (int k = 0; k < 6; k++) b->mom[c * 6 + k] = rdf(q + 14 + 4 * k);
+          memcpy(b->bb + c * 6, q + 38, 6);
         }
+        memcpy(keep, t, tl);
+        b->nbox = keep[0];
+        b->boxes = keep + 1;
+        const uint8_t *r = keep + 1 + 3 * b->nbox;
+        b->full = *r++;
+        for (int f = 0; f < 6; f++) {
+          b->nq[f] = r[0];
+          b->fq[f] = r + 1;
+          r += 1 + 3 * r[0];
+        }
+        blocks[i] = b;
+      }
+      p = t + tl;
+    }
+    arena_tmp_release(tm);
   }
   return true;
 }
@@ -454,7 +456,15 @@ Obj *objs;
 int obj_cap;
 int nobj, nlevelobj;
 Level level;
-static Prog **progs; /* by record */
+/* programs of the level (with their custom block children) */
+#define NPROG 48
+static Prog *progs[NPROG];
+static int nprogs;
+static Prog *prog_of(int rec) {
+  for (int i = 0; i < nprogs; i++)
+    if (progs[i]->rec == rec) return progs[i];
+  return 0;
+}
 
 int op_data_size(int op) {
   switch (op) {
@@ -469,17 +479,21 @@ int op_data_size(int op) {
 }
 
 
+static bool load_children(Prog *p);
 static Prog *load_prog(int rec) {
-  if (progs[rec]) return progs[rec];
+  Prog *old = prog_of(rec);
+  if (old) return old;
+  if (nprogs == NPROG) return 0;
   const uint8_t *d = load_rec(rec);
   if (!d) return 0;
   Prog *p = arena_alloc(sizeof(Prog));
   memset(p, 0, sizeof *p);
-  progs[rec] = p;
+  progs[nprogs++] = p;
   p->rec = rec;
   const uint8_t *q = d;
   p->is_level = q[0] & 1;
-  p->yc = q[0] >> 1;
+  p->yc = (q[0] >> 1) & 15;
+  bool tables = q[0] & 0x80;
   p->nnodes = rd16(q + 1);
   p->nentries = rd16(q + 3);
   p->entries = q + 5;
@@ -497,17 +511,27 @@ static Prog *load_prog(int rec) {
   /* template objects */
   p->objdata = q;
   q = scan_objects(q);
+  if (tables) {
+    /* records read in place from flash carry their node offset and output slot tables */
+    p->nslots = rd16(q);
+    q += 2 + ((q + 2 - d) & 1);
+    p->off = (const uint16_t *)q;
+    p->slot = (const uint16_t *)(q + 2 * p->nnodes);
+    p->data = q + 4 * p->nnodes;
+    return load_children(p) ? p : 0;
+  }
   p->data = q;
   /* node offsets */
-  p->off = arena_alloc(2 * p->nnodes + 2);
-  p->slot = arena_alloc(2 * p->nnodes + 2);
-  if (!p->off || !p->slot) return 0;
+  uint16_t *off = arena_alloc(2 * p->nnodes + 2), *slot = arena_alloc(2 * p->nnodes + 2);
+  if (!off || !slot) return 0;
+  p->off = off;
+  p->slot = slot;
   uint16_t slots = 0;
   const uint8_t *n = q;
   for (int i = 0; i < p->nnodes; i++) {
-    p->off[i] = (uint16_t)(n - q);
+    off[i] = (uint16_t)(n - q);
     int op = n[0];
-    p->slot[i] = NONE16;
+    slot[i] = NONE16;
     if (op == OP_CUSTOM) {
       n += 10 + 2 * n[9]; /* header, inputs */
       n += 3 + 2 * n[2];  /* anchor object, self objects */
@@ -515,7 +539,7 @@ static Prog *load_prog(int rec) {
     }
     const unsigned char *sh = op_shape[op];
     if (sh[3] && sh[1]) {
-      p->slot[i] = slots;
+      slot[i] = slots;
       slots += sh[1];
     }
     n += 1 + 2 * sh[0];
@@ -524,16 +548,36 @@ static Prog *load_prog(int rec) {
     n += op_data_size(op);
   }
   p->nslots = slots;
+  return load_children(p) ? p : 0;
+}
+
+static bool load_children(Prog *p) {
   for (int i = 0; i < p->nnodes; i++) {
     const uint8_t *nd = p->data + p->off[i];
-    if (nd[0] == OP_CUSTOM && !load_prog(rd16(nd + 1))) return 0;
+    if (nd[0] == OP_CUSTOM && !load_prog(rd16(nd + 1))) return false;
   }
-  return p;
+  return true;
 }
 
 Prog *prog_child(const Prog *p, int i) {
   const uint8_t *nd = p->data + p->off[i];
-  return nd[0] == OP_CUSTOM ? progs[rd16(nd + 1)] : 0;
+  return nd[0] == OP_CUSTOM ? prog_of(rd16(nd + 1)) : 0;
+}
+
+float mat_tab[NMAT][2];
+int nmat;
+uint8_t mat_find(float friction, float bounce) {
+  int best = 0;
+  float bd = 1e30f;
+  for (int i = 0; i < nmat; i++) {
+    float df = mat_tab[i][0] - friction, db = mat_tab[i][1] - bounce, d = df * df + db * db;
+    if (d == 0) return (uint8_t)i;
+    if (d < bd) bd = d, best = i;
+  }
+  if (nmat == NMAT) return (uint8_t)best; /* full: the closest pair */
+  mat_tab[nmat][0] = friction;
+  mat_tab[nmat][1] = bounce;
+  return (uint8_t)nmat++;
 }
 
 static void obj_init(Obj *o, Shape *s) {
@@ -544,8 +588,7 @@ static void obj_init(Obj *o, Shape *s) {
   o->flags = OF_VISIBLE | (s->coll ? OF_COLLIDE : 0);
   for (int i = 0; i < s->np; i++)
     if (blocks[s->blk[i]]->flags & 4) o->flags |= OF_PHYSICS;
-  o->friction = 0.5f;
-  o->bounce = 0.0f;
+  o->mat = 0;
   o->mass = s->mass > 0 ? s->mass : 1;
 #ifdef HOST
   if (getenv("ND_DEFMASS")) o->mass *= atof(getenv("ND_DEFMASS"));
@@ -589,19 +632,19 @@ uint32_t st_arena_setup;
 bool world_load_level(int index) {
   level_index = index;
   arena_reset();
+  nmat = 0;
+  mat_find(0.5f, 0.0f); /* index 0: Fancade's defaults */
   memset(blocks, 0, sizeof blocks);
   memset(need_blk, 0, sizeof need_blk);
   nobj = 0;
-  int np = pack_records();
-  progs = arena_alloc(sizeof(Prog *) * np);
-  if (!progs) FAIL("world_load_level");
-  memset(progs, 0, sizeof(Prog *) * np);
+  nprogs = 0;
   /* the level record is only needed while loading: inflate it into free space, read the object
    * capacity, reserve the object table at the top, then keep the record just below it */
   uint32_t avail;
   uint8_t *d = arena_top(&avail);
-  uint32_t rn = pack_rawsize(level_rec[index]);
-  if (rn > avail || pack_load(level_rec[index], d, rn) != (int)rn) FAIL("world_load_level");
+  int lrec = rd16(level_entry(index));
+  uint32_t rn = pack_rawsize(lrec);
+  if (rn > avail || pack_load(lrec, d, rn) != (int)rn) FAIL("world_load_level");
   const uint8_t *q = d;
   int l = q[0];
   memcpy(level.name, q + 1, l < 39 ? l : 39);
@@ -640,12 +683,30 @@ bool world_load_level(int index) {
     nobj++;
   }
   nlevelobj = nobj;
-  for (int r = 0; r < np; r++) {
+  for (int r = 0; r < nprogs; r++) {
     Prog *p = progs[r];
-    if (!p) continue;
     p->tmpl = build_shapes(p->objdata, &p->ntmpl);
     if (!p->tmpl) FAIL("world_load_level");
   }
+#ifdef HOST
+  if (getenv("ND_SHDBG")) {
+    for (int r = -1; r < nprogs; r++) {
+      Shape **ss = r < 0 ? shapes : progs[r]->tmpl;
+      int ns = r < 0 ? n : progs[r]->ntmpl;
+      for (int i = 0; i < ns; i++) {
+        Shape *sh = ss[i];
+        uint32_t h = 2166136261u, k0 = sh->np ? sh->key[0] & ~7u : 0;
+        uint32_t x0 = k0 >> 20, y0 = (k0 >> 13) & 127, z0 = (k0 >> 3) & 1023;
+        for (int j = 0; j < sh->np; j++) {
+          uint32_t k = sh->key[j], d = ((k >> 20) - x0) << 20 | (((k >> 13) & 127) - y0) << 13 | (((k >> 3) & 1023) - z0) << 3 | (k & 7);
+          h = (h ^ d) * 16777619u;
+          h = (h ^ sh->blk[j]) * 16777619u;
+        }
+        fprintf(stderr, "SHAPE r%d i%d np %d hash %08x\n", r, i, sh->np, h);
+      }
+    }
+  }
+#endif
   if (!vm_setup_envs()) FAIL("world_load_level");
   arena_tmp_reset(); /* the level record and template lists are only needed while instantiating */
 #ifdef HOST

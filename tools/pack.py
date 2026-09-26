@@ -52,6 +52,7 @@ class Packer:
         self.records = []       # raw record bytes
         self.prog_record = {}   # prefab id -> record index
         self.children = {}      # program record -> child program records
+        self.node_tables = {}   # program record -> (header length, node offsets, slots, slot count)
 
     # ---------------------------------------------------------------- blocks
     def blk(self, id):
@@ -80,39 +81,34 @@ class Packer:
             flags = min(s.collider, 2) | ((1 if s.type == PHYSICS else 0) << 2) | ((1 if id < self.g.id_offset else 0) << 3)
             w.u8(flags)
             w.u8(info.ncomp)
-            bits = bytearray(64)
+            # per component voxel statistics (voxel units): count, sums and second moments of voxel centres, bounds
+            st = [[0, [0.0] * 3, [0.0] * 6, [8, 8, 8, 0, 0, 0]] for _ in range(info.ncomp)]
             for i in range(512):
-                if info.solid[i]:
-                    bits[i >> 3] |= 1 << (i & 7)
-            w.b += bits
-            if info.ncomp > 1:
-                nib = bytearray(256)
-                for i in range(512):
-                    c = max(info.comp[i], 0)
-                    nib[i >> 1] |= (c & 15) << ((i & 1) * 4)
-                w.b += nib
+                if not info.solid[i]:
+                    continue
+                x, y, z = i & 7, (i >> 3) & 7, i >> 6
+                c = max(info.comp[i], 0) & 15 if info.ncomp > 1 else 0
+                e = st[c]
+                e[0] += 1
+                px, py, pz = x + 0.5, y + 0.5, z + 0.5
+                e[1][0] += px; e[1][1] += py; e[1][2] += pz
+                m = e[2]
+                m[0] += px * px; m[1] += py * py; m[2] += pz * pz
+                m[3] += px * py; m[4] += px * pz; m[5] += py * pz
+                b = e[3]
+                b[0] = min(b[0], x); b[1] = min(b[1], y); b[2] = min(b[2], z)
+                b[3] = max(b[3], x); b[4] = max(b[4], y); b[5] = max(b[5], z)
+            for cnt, sm, mo, bb in st:
+                w.u16(cnt)
+                for v in sm + mo:
+                    w.f32(v)
+                w.b += bytes(bb)
             boxes = info.boxes()
             assert len(boxes) < 256
             w.u8(len(boxes))
             for (c, x0, y0, z0, x1, y1, z1) in boxes:
                 v = c | x0 << 3 | y0 << 6 | z0 << 9 | (x1 - 1) << 12 | (y1 - 1) << 15 | (z1 - 1) << 18
                 w.b += struct.pack('<I', v)[:3]
-            # glue masks: per component, per face, 8x8 bits of solid sticky boundary voxels
-            for c in range(info.ncomp):
-                for f in range(6):
-                    d = DIRS[f]
-                    axis = [k for k in range(3) if d[k]][0]
-                    layer = 7 if d[axis] > 0 else 0
-                    ua, va = [k for k in range(3) if k != axis]
-                    m = 0
-                    for w_ in range(8):
-                        for u in range(8):
-                            p_ = [0, 0, 0]
-                            p_[axis] = layer; p_[ua] = u; p_[va] = w_
-                            i = vidx(*p_)
-                            if info.solid[i] and info.comp[i] == c and info.sticky(p_[0], p_[1], p_[2], f):
-                                m |= 1 << (u + w_ * 8)
-                    w.b += struct.pack('<Q', m)
             full = 0
             for f in range(6):
                 if info.full[f]:
@@ -229,7 +225,18 @@ class Packer:
         w = W()
         selfmap = {}
         body = W()
+        offs, slots, nslots = [], [], 0
         for n in prog.nodes:
+            offs.append(len(body.b))
+            if n.op != ops.OP_CUSTOM:
+                o = ops.OPS[ops.SUPPORTED[n.op]]
+                if o['active'] and o['outs']:
+                    slots.append(nslots)
+                    nslots += len(o['outs'])
+                else:
+                    slots.append(0xFFFF)
+            else:
+                slots.append(0xFFFF)
             body.u8(n.op)
             if n.op == ops.OP_CUSTOM:
                 body.u16(self.prog_record[n.custom_prog])
@@ -299,6 +306,7 @@ class Packer:
             self.write_objects(w, prog)
         else:
             w.u16(0)
+        self.node_tables[idx] = (len(w.b), offs, slots, nslots)
         w.b += body.b
         prog.selfmap = selfmap
         self.records[idx] = bytes(w.b)
@@ -385,9 +393,26 @@ class Packer:
         self.records[0] = bytes(d.b)
         return self.records
 
+    def with_tables(self, i):
+        """a program record read in place gets its node offset and output slot tables (bit 7 of byte 0)"""
+        r = self.records[i]
+        hl, offs, slots, nslots = self.node_tables[i]
+        t = W()
+        t.u16(nslots)
+        if (hl + 2) & 1:
+            t.u8(0)
+        for o in offs:
+            t.u16(o)
+        for sl in slots:
+            t.u16(sl)
+        return bytes([r[0] | 0x80]) + r[1:hl] + bytes(t.b) + r[hl:]
+
     def serialize(self):
         # records read in place from flash (no RAM copy): the directory and programs used by most levels
         self.raw = {0} | {r for r, n in self.uses.items() if n >= 100}
+        for i in self.raw:
+            if i in self.node_tables:
+                self.records[i] = self.with_tables(i)
         comp = []
         for i, r in enumerate(self.records):
             if i in self.raw:
@@ -399,13 +424,17 @@ class Packer:
         out.b += MAGIC
         out.u16(len(self.records))
         hdr = 4 + 2 + 4 * (len(self.records) + 1) + 4 * len(self.records)
-        off = hdr
+        # every record starts 4-byte aligned (tables in records read in place are accessed directly)
+        comp = [c + bytes(-len(c) & 3) for c in comp]
+        start = (hdr + 3) & ~3
+        off = start
         for c in comp:
             out.u32(off)
             off += len(c)
         out.u32(off)
         for i, r in enumerate(self.records):
             out.u32(len(r) | (0x80000000 if i in self.raw else 0))
+        out.b += bytes(start - hdr)
         for c in comp:
             out.b += c
         return bytes(out.b)

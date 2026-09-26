@@ -66,6 +66,12 @@ static void sim_step(uint8_t buttons) {
 #endif
   phys_step();
 #ifdef HOST
+  if (getenv("ND_OBJHIST") && vm_frame_count == atoi(getenv("ND_OBJHIST"))) {
+    for (int i = 0; i < nobj; i++)
+      fprintf(stderr, "OBJ %d src %d np %d flags %x pos %.1f %.1f %.1f\n", i, objs[i].src, objs[i].shape->np, objs[i].flags, objs[i].pos.x, objs[i].pos.y, objs[i].pos.z);
+  }
+#endif
+#ifdef HOST
   {
     extern void phys_debug(int);
     phys_debug(vm_frame_count);

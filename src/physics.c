@@ -62,19 +62,31 @@ typedef struct {
   float rax, ray, rbx, rby;
 } Contact;
 
+/* springs and motors, allocated for the joints that get one */
 typedef struct {
-  int a, b;              /* body indices (a = base, -1 = static base object sobj), b = part */
-  int sobj;              /* static base object (moves with Set Position), -1 = none */
-  vec3 la, lb;           /* anchors in rest frames (relative to com) */
-  vec3 axx;              /* base frame x axis in the base rest frame */
-  float ref;             /* reference relative angle */
-  float lo[3], hi[3];    /* x, y, angle limits (lo > hi = free) */
-  float k[3], c[3];      /* springs (k == 0: none) */
-  float mv[3], mf[3];    /* motor target velocity and max force */
-  float acc[3], accm[3], accl[3]; /* accumulated impulses: spring, motor, limit/lock */
-  float spt[3], splo[3], sphi[3];   /* spring row target velocity and impulse range (per step) */
-  uint8_t spring[3];
+  float k[3], c[3];   /* spring stiffness and damping */
+  float mv[3], mf[3]; /* motor target velocity and max force */
+} JointExt;
+
+typedef struct {
+  int16_t a, b;       /* body indices (a = base, -1 = static base object sobj), b = part, < 0 detached */
+  int16_t sobj;       /* static base object (moves with Set Position), -1 = none */
+  uint8_t spring;     /* bit k: dof k has a spring */
+  JointExt *ext;
+  vec3 la, lb;        /* anchors in rest frames (relative to com) */
+  vec3 axx;           /* base frame x axis in the base rest frame */
+  float ref;          /* reference relative angle */
+  float lo[3], hi[3]; /* x, y, angle limits (lo > hi = free) */
 } Joint;
+
+/* solver state of one step, kept in the free arena with the contacts */
+typedef struct {
+  float accl[3]; /* accumulated limit / lock impulses */
+} JointTmp;
+typedef struct {
+  float acc[3], accm[3];          /* accumulated spring and motor impulses */
+  float spt[3], splo[3], sphi[3]; /* spring row target velocity and impulse range */
+} JointExtTmp;
 
 /* per level pools (arena) */
 static Body *bodies;
@@ -84,6 +96,8 @@ static Contact *con; /* scratch space, valid during a step */
 static int ncon, con_cap;
 static Joint *joints;
 static int njoints, joint_cap;
+static JointTmp *jtmp;
+static JointExtTmp *etmp;
 static struct { int16_t a, b; float imp; float nx, ny; } events[MAX_EVENTS];
 static int nevents;
 
@@ -405,22 +419,27 @@ static void body_mass(Body *b) {
   const Shape *s = o->shape;
   b->mass = o->mass * k_mass_scale;
   if (b->mass <= 0) b->mass = 0.01f;
-  /* inertia about z from voxel distribution, scaled to the mass */
+  /* inertia about the world z axis from the voxel distribution (per component moments), scaled to the mass */
   float I = 0, m = 0;
   for (int i = 0; i < s->np; i++) {
     const Block *bk = blocks[s->blk[i]];
     int comp = PK_C(s->key[i]);
-    float cx = PK_X(s->key[i]) - s->com.x, cy = PK_Y(s->key[i]) - s->com.y, cz = PK_Z(s->key[i]) - s->com.z;
-    for (int z = 0; z < 8; z++)
-      for (int y = 0; y < 8; y++)
-        for (int x = 0; x < 8; x++) {
-          if (!blk_solid(bk, x, y, z) || blk_comp(bk, x, y, z) != comp) continue;
-          /* about the world z axis: the body may be turned about x or y */
-          float lx = cx + (x + 0.5f) / 8, ly = cy + (y + 0.5f) / 8, lz = cz + (z + 0.5f) / 8;
-          float dx = b->m00 * lx + b->m01 * ly + b->m02 * lz, dy = b->m10 * lx + b->m11 * ly + b->m12 * lz;
-          I += dx * dx + dy * dy + 1.0f / 384.0f;
-          m += 1;
-        }
+    float n = bk->cnt[comp];
+    if (n <= 0) continue;
+    float c0 = PK_X(s->key[i]) - s->com.x, c1 = PK_Y(s->key[i]) - s->com.y, c2 = PK_Z(s->key[i]) - s->com.z;
+    const float *sm = bk->sum + comp * 3, *mo = bk->mom + comp * 6;
+    /* second moments of the voxel centres l = cell + v, in world units */
+    float s0 = sm[0] / 8, s1 = sm[1] / 8, s2 = sm[2] / 8;
+    float mxx = n * c0 * c0 + 2 * c0 * s0 + mo[0] / 64, myy = n * c1 * c1 + 2 * c1 * s1 + mo[1] / 64;
+    float mzz = n * c2 * c2 + 2 * c2 * s2 + mo[2] / 64, mxy = n * c0 * c1 + c0 * s1 + c1 * s0 + mo[3] / 64;
+    float mxz = n * c0 * c2 + c0 * s2 + c2 * s0 + mo[4] / 64, myz = n * c1 * c2 + c1 * s2 + c2 * s1 + mo[5] / 64;
+    /* the body may be turned about x or y: sum of (row . l)^2 over the two rows in the plane */
+    for (int r = 0; r < 2; r++) {
+      float a = r ? b->m10 : b->m00, bb = r ? b->m11 : b->m01, cc = r ? b->m12 : b->m02;
+      I += a * a * mxx + bb * bb * myy + cc * cc * mzz + 2 * (a * bb * mxy + a * cc * mxz + bb * cc * myz);
+    }
+    I += n / 384.0f;
+    m += n;
   }
   if (m <= 0) {
     I = 1;
@@ -581,8 +600,8 @@ void phys_set_mass(int o, float m) {
   Body *b = wake(o);
   if (b) body_mass(b);
 }
-void phys_set_friction(int o, float f) { objs[o].friction = f; }
-void phys_set_bounce(int o, float v) { objs[o].bounce = v; }
+void phys_set_friction(int o, float f) { objs[o].mat = mat_find(f, obj_bounce(&objs[o])); }
+void phys_set_bounce(int o, float v) { objs[o].mat = mat_find(obj_friction(&objs[o]), v); }
 void phys_set_gravity(vec3 g) { phys_gravity = g; }
 
 void phys_moved(int o) {
@@ -651,9 +670,9 @@ int phys_add_constraint(int base, int part, vec3 pivot) {
   Body *bb = body(base);
   Joint *j = &joints[njoints];
   memset(j, 0, sizeof *j);
-  j->b = (int)(pb - bodies);
-  j->a = bb ? (int)(bb - bodies) : -1;
-  j->sobj = bb ? -1 : base;
+  j->b = (int16_t)(pb - bodies);
+  j->a = (int16_t)(bb ? (int)(bb - bodies) : -1);
+  j->sobj = (int16_t)(bb ? -1 : base);
   if (bb) {
     j->la = qrot(qconj(bb->rot), vsub(pivot, v3(bb->x, bb->y, bb->z)));
     j->axx = qrot(qconj(bb->rot), v3(1, 0, 0));
@@ -684,34 +703,44 @@ void phys_con_limits(int c, bool ang, vec3 lo, vec3 hi) {
   }
 }
 
+static JointExt *joint_ext(int c) {
+  if (c < 0 || c >= njoints) return 0;
+  Joint *j = &joints[c];
+  if (!j->ext) {
+    j->ext = arena_alloc(sizeof(JointExt));
+    if (j->ext) memset(j->ext, 0, sizeof(JointExt));
+  }
+  return j->ext;
+}
+
 void phys_con_spring(int c, bool ang, vec3 k, vec3 d) {
-  if (c < 0 || c >= njoints) return;
+  JointExt *x = joint_ext(c);
+  if (!x) return;
   Joint *j = &joints[c];
   if (ang) {
-    j->k[2] = k.z;
-    j->c[2] = d.z;
-    j->spring[2] = k.z > 0 || d.z > 0;
+    x->k[2] = k.z;
+    x->c[2] = d.z;
+    j->spring = (uint8_t)((j->spring & 3) | (k.z > 0 || d.z > 0) << 2);
   } else {
-    j->k[0] = k.x;
-    j->c[0] = d.x;
-    j->spring[0] = k.x > 0 || d.x > 0;
-    j->k[1] = k.y;
-    j->c[1] = d.y;
-    j->spring[1] = k.y > 0 || d.y > 0;
+    x->k[0] = k.x;
+    x->c[0] = d.x;
+    x->k[1] = k.y;
+    x->c[1] = d.y;
+    j->spring = (uint8_t)((j->spring & 4) | (k.x > 0 || d.x > 0) | (k.y > 0 || d.y > 0) << 1);
   }
 }
 
 void phys_con_motor(int c, bool ang, vec3 v, vec3 f) {
-  if (c < 0 || c >= njoints) return;
-  Joint *j = &joints[c];
+  JointExt *x = joint_ext(c);
+  if (!x) return;
   if (ang) {
-    j->mv[2] = v.z * DEG2RAD;
-    j->mf[2] = fabsf(f.z) * k_motor_scale;
+    x->mv[2] = v.z * DEG2RAD;
+    x->mf[2] = fabsf(f.z) * k_motor_scale;
   } else {
-    j->mv[0] = v.x;
-    j->mf[0] = fabsf(f.x) * k_lin_motor_scale;
-    j->mv[1] = v.y;
-    j->mf[1] = fabsf(f.y) * k_lin_motor_scale;
+    x->mv[0] = v.x;
+    x->mf[0] = fabsf(f.x) * k_lin_motor_scale;
+    x->mv[1] = v.y;
+    x->mf[1] = fabsf(f.y) * k_lin_motor_scale;
   }
 }
 
@@ -1170,8 +1199,8 @@ static void gen_contacts(void) {
       cur_a = i;
       cur_b = -1;
       cur_sobj = s;
-      cur_mu = mix_friction(oa->friction, os->friction);
-      cur_rest = oa->bounce * os->bounce;
+      cur_mu = mix_friction(obj_friction(oa), obj_friction(os));
+      cur_rest = obj_bounce(oa) * obj_bounce(os);
       for (int e = 0; e < na; e++) collide_static(A, &wa[e], s);
     }
     /* faces buried in another static object (overlapping track pieces) are internal too */
@@ -1187,7 +1216,7 @@ static void gen_contacts(void) {
       cur_a = i;
       cur_b = -1;
       cur_sobj = -1;
-      cur_mu = mix_friction(oa->friction, 0.5f);
+      cur_mu = mix_friction(obj_friction(oa), 0.5f);
       cur_rest = 0;
       for (int e = 0; e < na; e++) {
         const WElem *w = &wa[e];
@@ -1214,8 +1243,8 @@ static void gen_contacts(void) {
       cur_a = i;
       cur_b = j;
       cur_sobj = -1;
-      cur_mu = mix_friction(oa->friction, ob->friction);
-      cur_rest = oa->bounce * ob->bounce;
+      cur_mu = mix_friction(obj_friction(oa), obj_friction(ob));
+      cur_rest = obj_bounce(oa) * obj_bounce(ob);
       WElem wb[MAX_ELEMS];
       int nb = B->nel < MAX_ELEMS ? B->nel : MAX_ELEMS;
       for (int e = 0; e < nb; e++) elem_world(B, &B->el[e], &wb[e]);
@@ -1380,8 +1409,12 @@ static void joint_frame(Joint *j, Body **pa, Body **pb, float *rax, float *ray, 
 }
 
 static void solve_joints(bool first) {
+  JointExtTmp *et = etmp;
   for (int ji = 0; ji < njoints; ji++) {
     Joint *j = &joints[ji];
+    JointExt *x = j->ext;
+    JointExtTmp *t = x ? et++ : 0;
+    JointTmp *jt = &jtmp[ji];
     if (j->b < 0 || bodies[j->b].obj < 0 || (j->a >= 0 && bodies[j->a].obj < 0)) continue;
     Body *A, *B;
     float rax, ray, rbx, rby, cx, cy, ex, ey, ang;
@@ -1413,33 +1446,33 @@ static void solve_joints(bool first) {
       bool free_ = lo > hi;
       float imp = 0;
       /* motor */
-      if (j->mf[k] > 0) {
-        float maxi = j->mf[k] * DT;
-        float d = m * (j->mv[k] - rv);
-        float old = j->accm[k];
-        j->accm[k] = clampf(old + d, -maxi, maxi);
-        imp += j->accm[k] - old;
-        rv += (j->accm[k] - old) / m;
+      if (x && x->mf[k] > 0) {
+        float maxi = x->mf[k] * DT;
+        float d = m * (x->mv[k] - rv);
+        float old = t->accm[k];
+        t->accm[k] = clampf(old + d, -maxi, maxi);
+        imp += t->accm[k] - old;
+        rv += (t->accm[k] - old) / m;
       }
       /* spring: Bullet's 6DofSpring2 row, velocity target rv0 + f with the impulse clamped to f */
-      if (j->spring[k] && (free_ || lo < hi)) {
+      if (x && (j->spring >> k & 1) && (free_ || lo < hi)) {
         if (first) {
           /* Bullet limits stiff springs to what the time step can sample, and over-damping */
           float mr;
           if (k < 2) mr = 1.0f / ((A ? A->invm : 0) + B->invm);
           else mr = 1.0f / ((A ? A->invi * A->lockr : 0) + B->invi * B->lockr + 1e-9f);
-          float ks = j->k[k], kd = j->c[k];
+          float ks = x->k[k], kd = x->c[k];
           if (0.25f < sqrtf(ks / mr) * DT) ks = mr / (DT * DT * 16.0f);
           if (kd * DT > mr) kd = mr / DT;
           float fd = -kd * rv * DT, f = -ks * err[k] * DT + fd;
-          j->spt[k] = rv + f;
-          j->splo[k] = fminf(fminf(f, fd), 0);
-          j->sphi[k] = fmaxf(fmaxf(f, fd), 0);
+          t->spt[k] = rv + f;
+          t->splo[k] = fminf(fminf(f, fd), 0);
+          t->sphi[k] = fmaxf(fmaxf(f, fd), 0);
         }
-        float d = m * (j->spt[k] - rv);
-        float old = j->acc[k];
-        j->acc[k] = clampf(old + d, j->splo[k], j->sphi[k]);
-        d = j->acc[k] - old;
+        float d = m * (t->spt[k] - rv);
+        float old = t->acc[k];
+        t->acc[k] = clampf(old + d, t->splo[k], t->sphi[k]);
+        d = t->acc[k] - old;
         imp += d;
         rv += d / m;
       }
@@ -1449,20 +1482,20 @@ static void solve_joints(bool first) {
         if (lo == hi) {
           target = -0.2f / DT * (err[k] - lo);
           float d = m * (target - rv);
-          j->accl[k] += d;
+          jt->accl[k] += d;
           imp += d;
         } else if (err[k] <= lo) {
           target = -0.2f / DT * (err[k] - lo);
           float d = m * (fmaxf(target, 0) - rv);
-          float old = j->accl[k];
-          j->accl[k] = fmaxf(old + d, 0);
-          imp += j->accl[k] - old;
+          float old = jt->accl[k];
+          jt->accl[k] = fmaxf(old + d, 0);
+          imp += jt->accl[k] - old;
         } else if (err[k] >= hi) {
           target = -0.2f / DT * (err[k] - hi);
           float d = m * (fminf(target, 0) - rv);
-          float old = j->accl[k];
-          j->accl[k] = fminf(old + d, 0);
-          imp += j->accl[k] - old;
+          float old = jt->accl[k];
+          jt->accl[k] = fminf(old + d, 0);
+          imp += jt->accl[k] - old;
         }
       }
       if (imp == 0) continue;
@@ -1480,9 +1513,23 @@ static void solve_joints(bool first) {
 
 /* ------------------------------------------------------------------- step */
 void phys_step(void) {
-  /* contacts live in the free arena space: nothing is allocated during a step */
+  /* joint solver state and contacts live in the free arena space: nothing is allocated during a step */
   uint32_t avail;
-  con = arena_top(&avail);
+  uint8_t *top = arena_top(&avail);
+  int next = 0;
+  for (int ji = 0; ji < njoints; ji++)
+    if (joints[ji].ext) next++;
+  uint32_t jbytes = (uint32_t)(njoints * sizeof(JointTmp) + next * sizeof(JointExtTmp) + 7) & ~7u;
+  bool jok = jbytes <= avail;
+  if (!jok) {
+    OOM("joint state");
+    jbytes = 0;
+  }
+  memset(top, 0, jbytes);
+  jtmp = (JointTmp *)top;
+  etmp = (JointExtTmp *)(top + njoints * sizeof(JointTmp));
+  con = (Contact *)(top + jbytes);
+  avail -= jbytes;
   con_cap = (int)(avail / sizeof(Contact));
   if (con_cap > MAX_CONTACTS) con_cap = MAX_CONTACTS;
   /* external forces */
@@ -1502,12 +1549,8 @@ void phys_step(void) {
   }
   gen_contacts();
   prep_contacts();
-  for (int ji = 0; ji < njoints; ji++) {
-    Joint *j = &joints[ji];
-    for (int k = 0; k < 3; k++) j->acc[k] = j->accm[k] = j->accl[k] = 0;
-  }
   for (int it = 0; it < ITER; it++) {
-    solve_joints(it == 0);
+    if (jok) solve_joints(it == 0);
     solve_contacts();
   }
   for (int i = 0; i < nbodies; i++) bodies[i].pvx = bodies[i].pvy = bodies[i].pw = 0;
@@ -1569,11 +1612,15 @@ bool phys_collision(int o, int *other, float *impulse, vec3 *normal) {
 #include <stdio.h>
 #include <stdlib.h>
 int st_bodies, st_joints, st_con, st_elems, st_obj, st_elem_body;
+long st_slack = 1L << 30;
+uint32_t st_slack_pos;
+int st_slack_con, st_slack_obj;
 static void stats_dump(void) {
   extern uint32_t arena_peak;
   extern int st_obj_setup;
   extern uint32_t st_arena_setup;
   printf("STATS setup_arena=%u setup_obj=%d ", st_arena_setup, st_obj_setup);
+  printf("SLACK %ld pos %u con %d obj %d ", st_slack, st_slack_pos, st_slack_con, st_slack_obj);
   printf("STATS arena=%u obj=%d bodies=%d joints=%d con=%d elems=%d maxel=%d\n", arena_peak, st_obj, st_bodies,
          st_joints, st_con, st_elems, st_elem_body);
 }
@@ -1586,6 +1633,17 @@ void phys_debug(int frame) {
   if (nbodies > st_bodies) st_bodies = nbodies;
   if (njoints > st_joints) st_joints = njoints;
   if (ncon > st_con) st_con = ncon;
+  {
+    extern uint32_t arena_free(void);
+    long slack = (long)arena_free() - (long)(ncon * sizeof(Contact));
+    if (slack < st_slack) {
+      st_slack = slack;
+      extern uint32_t arena_used(void);
+      st_slack_pos = arena_used();
+      st_slack_con = ncon;
+      st_slack_obj = nobj;
+    }
+  }
   if (nelems > st_elems) st_elems = nelems;
   if (nobj > st_obj) st_obj = nobj;
   for (int i = 0; i < nbodies; i++)
@@ -1634,8 +1692,9 @@ void phys_debug(int frame) {
   }
   for (int j = 0; j < njoints; j++) {
     Joint *jt = &joints[j];
+    JointExt z = {{0}}, *x = jt->ext ? jt->ext : &z;
     printf("  j%d a=%d b=%d lo=(%.2f,%.2f,%.2f) hi=(%.2f,%.2f,%.2f) k=(%.1f,%.1f,%.1f) mv=%.2f mf=%.2f\n", j, jt->a, jt->b, jt->lo[0],
-           jt->lo[1], jt->lo[2], jt->hi[0], jt->hi[1], jt->hi[2], jt->k[0], jt->k[1], jt->k[2], jt->mv[2], jt->mf[2]);
+           jt->lo[1], jt->lo[2], jt->hi[0], jt->hi[1], jt->hi[2], x->k[0], x->k[1], x->k[2], x->mv[2], x->mf[2]);
   }
 }
 #endif
