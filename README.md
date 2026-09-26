@@ -1,6 +1,4 @@
-> [!IMPORTANT]
-> # NumDrive is now part of [NumPlay](https://github.com/Mason363/NumPlay)
-> **NumPlay is newer and more actively maintained**: a collection of NumWorks games in one app, with the latest fixes to NumDrive. Every game is still available on its own: **[download NumDrive.nwa](https://github.com/Mason363/NumPlay/releases/latest/download/NumDrive.nwa)**.
+# This version may be outdated. Check out [NumPlay](https://github.com/Mason363/NumPlay) for the most up-to-date version.
 
 # NumDrive: Drive Mad for NumWorks
 
