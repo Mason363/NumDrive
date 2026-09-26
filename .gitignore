@@ -1,0 +1,6 @@
+output/
+host/nd
+host/nd_*
+host/out*/
+host/test_inflate
+src/pack.c
