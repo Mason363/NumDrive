@@ -68,6 +68,13 @@ typedef struct {
   float rax, ray, rbx, rby;
 } Contact;
 
+/* last step's contact impulses, to start the solver from (Bullet's warm starting) */
+typedef struct {
+  int16_t a, o;   /* body, other body (>= 0) or -2 - static object, -1 for the floor */
+  int16_t lx, ly; /* point in a's frame, 1/256 units */
+  float jn, jt;
+} Warm;
+
 /* springs and motors, allocated for the joints that get one */
 typedef struct {
   float k[3], c[3];   /* spring stiffness and damping */
@@ -100,6 +107,8 @@ static int nbodies, body_cap;
 static int nelems;
 static Contact *con; /* scratch space, valid during a step */
 static int ncon, con_cap;
+static Warm *warm;
+static int nwarm, warm_cap;
 static Joint *joints;
 static int njoints, joint_cap;
 static JointTmp *jtmp;
@@ -523,6 +532,8 @@ void phys_reset(void) {
 #endif
   phys_gravity = v3(0, -9.8f, 0);
   nbodies = body_cap = 0;
+  warm = 0;
+  nwarm = warm_cap = 0;
   nelems = 0;
   njoints = joint_cap = 0;
   ncon = 0;
@@ -631,8 +642,18 @@ void phys_set_mass(int o, float m) {
   Body *b = wake(o);
   if (b) body_mass(b);
 }
-void phys_set_friction(int o, float f) { objs[o].mat = mat_find(f, obj_bounce(&objs[o])); }
-void phys_set_bounce(int o, float v) { objs[o].mat = mat_find(obj_friction(&objs[o]), v); }
+void phys_set_friction(int o, float f) {
+#ifdef HOST
+  if (getenv("ND_PDBG")) fprintf(stderr, "setfriction obj%d %.3f\n", o, f);
+#endif
+  objs[o].mat = mat_find(f, obj_bounce(&objs[o]));
+}
+void phys_set_bounce(int o, float v) {
+#ifdef HOST
+  if (getenv("ND_PDBG")) fprintf(stderr, "setbounce obj%d %.3f\n", o, v);
+#endif
+  objs[o].mat = mat_find(obj_friction(&objs[o]), v);
+}
 void phys_set_gravity(vec3 g) { phys_gravity = g; }
 
 void phys_moved(int o) {
@@ -802,7 +823,7 @@ static void add_contact(float px, float py, float nx, float ny, float depth) {
   c->a = cur_a;
   c->b = cur_b;
   c->sobj = cur_sobj;
-  c->acirc = cur_acirc;
+  c->acirc = cur_acirc | (cur_bcirc ? 2 : 0);
   c->px = px;
   c->py = py;
   c->nx = nx;
@@ -1544,13 +1565,58 @@ static void solve_contact3(Contact *c) {
   }
 }
 
+static inline int warm_other(const Contact *c) { return c->b >= 0 ? c->b : c->sobj >= 0 ? -2 - c->sobj : -1; }
+
+static inline void warm_point(const Contact *c, int *lx, int *ly) {
+  const Body *A = &bodies[c->a];
+  float dx = c->px - A->x, dy = c->py - A->y;
+  float x = (A->m00 * dx + A->m10 * dy) * 256, y = (A->m01 * dx + A->m11 * dy) * 256;
+  *lx = x > 32767 ? 32767 : x < -32767 ? -32767 : (int)x;
+  *ly = y > 32767 ? 32767 : y < -32767 ? -32767 : (int)y;
+}
+
+/* start each contact from the impulses of the same contact last step (both lists run in body order) */
+static void warm_start(void) {
+  int w = 0;
+  for (int i = 0; i < ncon; i++) {
+    Contact *c = &con[i];
+    while (w < nwarm && warm[w].a < c->a) w++;
+    /* wheels keep the cold start their handling was matched with */
+    if (c->acirc) continue;
+    int o = warm_other(c), lx, ly;
+    warm_point(c, &lx, &ly);
+    for (int k = w; k < nwarm && warm[k].a == c->a; k++) {
+      Warm *m = &warm[k];
+      int dx = m->lx - lx, dy = m->ly - ly;
+      /* the same point: within Bullet's contact breaking threshold, 0.02 */
+      if (m->o != o || dx * dx + dy * dy > 5 * 5) continue;
+      c->jn = m->jn * 0.85f;
+      c->jt = m->jt * 0.85f;
+      m->o = -32768; /* used */
+      break;
+    }
+  }
+}
+
+static void warm_store(void) {
+  nwarm = 0;
+  for (int i = 0; i < ncon && nwarm < warm_cap; i++) {
+    const Contact *c = &con[i];
+    Warm *m = &warm[nwarm++];
+    int lx, ly;
+    warm_point(c, &lx, &ly);
+    m->a = c->a, m->o = (int16_t)warm_other(c), m->lx = (int16_t)lx, m->ly = (int16_t)ly;
+    m->jn = c->jn, m->jt = c->jt;
+  }
+}
+
 static void prep_contacts(void) {
   for (int i = 0; i < ncon; i++) {
     Contact *c = &con[i];
     Body *A = &bodies[c->a];
     Body *B = c->b >= 0 ? &bodies[c->b] : 0;
     /* like Bullet, a wheel rolls on its full radius however deep it sits */
-    float sa = c->acirc ? c->depth : 0;
+    float sa = (c->acirc & 1) ? c->depth : 0;
     c->rax = c->px - c->nx * sa - A->x;
     c->ray = c->py - c->ny * sa - A->y;
     if (B) {
@@ -1567,7 +1633,28 @@ static void prep_contacts(void) {
     /* parts only near each other in 3D may close the gap first */
     c->bias = c->z3 && c->depth < 0 ? c->depth / DT : 0;
     c->pbias = 0.2f / DT * fmaxf(0, c->depth - 0.005f);
+    if (!c->acirc) {
+      /* between boxes, like Bullet: shallow penetration is pushed out in the velocity solve (erp 0.2),
+         deep with split impulses (erp2 0.8), and parts just apart may close their gap */
+      if (c->depth < 0) c->bias = c->depth / DT, c->pbias = 0;
+      else if (c->depth < 0.04f) c->bias = 0.2f * c->depth / DT, c->pbias = 0;
+      else c->bias = 0, c->pbias = 0.8f * c->depth / DT;
+    }
     if (c->rest > 0 && vn < -1.0f) c->bias += -c->rest * vn;
+    if (c->jn > 0 || c->jt != 0) {
+      /* the warm start: last step's impulses, applied up front */
+      float jx = c->nx * c->jn - c->ny * c->jt, jy = c->ny * c->jn + c->nx * c->jt;
+      if (c->z3) {
+        float t[2][3];
+        tangents3(c, t[0], t[1]);
+        jx = c->nx * c->jn + t[0][0] * c->jt, jy = c->ny * c->jn + t[0][1] * c->jt;
+        apply3(A, c->rax, c->ray, jx, jy, c->nz * c->jn);
+        if (B) apply3(B, c->rbx, c->rby, -jx, -jy, -c->nz * c->jn);
+      } else {
+        apply(A, c->rax, c->ray, jx, jy);
+        if (B) apply(B, c->rbx, c->rby, -jx, -jy);
+      }
+    }
   }
 }
 
@@ -1792,9 +1879,18 @@ static void solve_joints(bool first) {
 
 /* ------------------------------------------------------------------- step */
 void phys_step(void) {
-  /* joint solver state and contacts live in the free arena space: nothing is allocated during a step */
+  /* joint solver state and contacts live in the free arena space: nothing is allocated during a step
+     (but for the warm start cache, once: an eighth of the space left after the level is set up) */
   uint32_t avail;
   uint8_t *top = arena_top(&avail);
+  if (!warm && nbodies) {
+    int cap = (int)(avail / 8 / sizeof(Warm));
+    if (cap > MAX_CONTACTS) cap = MAX_CONTACTS;
+    warm = cap > 0 ? arena_alloc(sizeof(Warm) * cap) : 0;
+    warm_cap = warm ? cap : 0;
+    nwarm = 0;
+    top = arena_top(&avail);
+  }
   int next = 0;
   for (int ji = 0; ji < njoints; ji++)
     if (joints[ji].ext) next++;
@@ -1834,11 +1930,13 @@ void phys_step(void) {
     if (k_angular_damping > 0) b->w *= 1 - k_angular_damping * DT;
   }
   gen_contacts();
+  warm_start();
   prep_contacts();
   for (int it = 0; it < ITER; it++) {
     if (jok) solve_joints(it == 0);
     solve_contacts();
   }
+  warm_store();
   for (int i = 0; i < nbodies; i++) bodies[i].pvx = bodies[i].pvy = bodies[i].pw = bodies[i].pvz = 0;
   for (int it = 0; it < ITER; it++) solve_split();
   /* events */
