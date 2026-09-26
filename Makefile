@@ -34,6 +34,9 @@ build: $(TARGET)
 $(TARGET): $(OBJECTS) $(EXTRA)
 	@echo "LD      $@"
 	$(Q) $(CC) $(CFLAGS) $^ $(LDFLAGS) -lm -o $@
+ifeq ($(PLATFORM),device)
+	$(Q) arm-none-eabi-strip --strip-debug $@
+endif
 
 $(BUILD_DIR)/%.o: src/%.c src/*.h | $(BUILD_DIR)
 	@echo "CC      $<"
