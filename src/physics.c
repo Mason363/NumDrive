@@ -277,9 +277,19 @@ static bool ray_shape(const Shape *s, vec3 o, vec3 d, float *best) {
 bool phys_raycast_ex(vec3 from, vec3 to, vec3 *hit, int *obj, int ignore) {
   float best = 1.0f;
   int bo = -1;
+  vec3 seg = vsub(to, from);
+  float sl = vdot(seg, seg), isl = sl > 1e-12f ? 1.0f / sl : 0;
   for (int i = 0; i < nobj; i++) {
     Obj *ob = &objs[i];
     if (!(ob->flags & OF_COLLIDE) || (ob->flags & OF_DEAD) || i == ignore) continue;
+    /* quick reject: the segment misses the sphere around the object's bounds */
+    const Shape *sh = ob->shape;
+    vec3 lo = vsub(sh->bmin, sh->origin), hi = vsub(sh->bmax, sh->origin);
+    vec3 ext = v3(fmaxf(-lo.x, hi.x), fmaxf(-lo.y, hi.y), fmaxf(-lo.z, hi.z));
+    vec3 rel = vsub(ob->pos, from);
+    float u = clampf(vdot(rel, seg) * isl, 0, 1);
+    vec3 dd = vsub(rel, vscale(seg, u));
+    if (vdot(dd, dd) > vdot(ext, ext) * 1.0001f + 1e-4f) continue;
     vec3 o = obj_local(ob, from), t = obj_local(ob, to);
     float b = best;
     if (ray_shape(ob->shape, o, vsub(t, o), &b) && b < best) {

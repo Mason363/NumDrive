@@ -335,8 +335,8 @@ void card_setup(int kind, int lvl) {
     cd.nbox = 2;
     cd.photo = (Box){44, -71, 91, 47, 0};
     for (int i = 0; i < 4; i++) add_run(&font_s, -86, -58 + i * 10, desc[i], C_WHITE, false);
-    add_run(&font_s, -86, 4, "Powered by Fancade.", C_WHITE, false);
-    add_run(&font_s, -86, 24, "By Martin Magni", C_WHITE, false);
+    add_run(&font_s, -86, 4, "Inspired by Drive Mad", C_WHITE, false);
+    add_run(&font_s, -86, 24, "Made by Mason Chen", C_WHITE, false);
     char *t = cd.txt[0];
     int n = lvl + 1, i = 0;
     const char *pre = "Level ";
@@ -348,7 +348,7 @@ void card_setup(int kind, int lvl) {
     add_run(&font_s, -86, 34, t, C_PANEL_TXT, false);
     strcpy(cd.txt[1], level_name(lvl));
     add_run(&font_s, -86, 43, cd.txt[1], C_PANEL_TXT, false);
-    add_run(&font_m, 0, 66, "Drive Mad", C_CAPTION, true);
+    add_run(&font_m, 0, 66, "NumDrive", C_CAPTION, true);
   } else {
     cd.w = 143;
     cd.h = 156;

@@ -25,8 +25,9 @@ static vec3 light_to; /* direction towards the light */
 static const float AMB[3] = {0.764f, 0.773f, 0.839f};
 static const float LEFF[3] = {0.444f, 0.423f, 0.304f};
 
-static uint16_t cbuf[SCREEN_W * STRIP_H];
-static uint16_t zbuf[SCREEN_W * STRIP_H];
+static uint16_t cbuf[SCREEN_W * STRIP_H] __attribute__((aligned(4)));
+static uint16_t zbuf[SCREEN_W * STRIP_H] __attribute__((aligned(4)));
+typedef uint32_t __attribute__((may_alias)) u32a;
 static int strip_y0, strip_y1; /* current strip rows [y0, y1) */
 static int clip_x0, clip_x1;
 /* per object, per frame: screen rows covered and part cache offset */
@@ -735,11 +736,18 @@ uint16_t *render_strip(int sy, int n, int x0, int x1) {
   strip_y1 = sy + n;
   clip_x0 = x0;
   clip_x1 = x1;
-  for (int r = 0; r < n; r++) {
-    uint16_t *c = cbuf + r * SCREEN_W, *z = zbuf + r * SCREEN_W;
-    for (int x = x0; x < x1; x++) {
-      c[x] = sky565;
-      z[x] = 0xFFFF;
+  if (x0 == 0 && x1 == SCREEN_W) {
+    /* whole rows: fill two pixels per word */
+    uint32_t sky2 = sky565 | (uint32_t)sky565 << 16;
+    u32a *c = (u32a *)cbuf, *z = (u32a *)zbuf;
+    for (int i = 0; i < n * SCREEN_W / 2; i++) c[i] = sky2, z[i] = 0xFFFFFFFFu;
+  } else {
+    for (int r = 0; r < n; r++) {
+      uint16_t *c = cbuf + r * SCREEN_W, *z = zbuf + r * SCREEN_W;
+      for (int x = x0; x < x1; x++) {
+        c[x] = sky565;
+        z[x] = 0xFFFF;
+      }
     }
   }
   for (int i = 0; i < nobj; i++) {

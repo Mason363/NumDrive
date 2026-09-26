@@ -24,16 +24,16 @@ jobs:
       - name: Build
         run: |
           make
-          cp output/device/drivemad.nwa DriveMad.nwa
+          cp output/device/numdrive.nwa NumDrive.nwa
       - name: Check RAM
         run: |
-          used=$(arm-none-eabi-size -A output/device/drivemad.nwa | awk '/^\.(data|bss)/ {s+=$2} END {print s}')
+          used=$(arm-none-eabi-size -A output/device/numdrive.nwa | awk '/^\.(data|bss)/ {s+=$2} END {print s}')
           echo "RAM used: $used of 153676 bytes"
           test "$used" -le 153676
       - uses: actions/upload-artifact@v4
         with:
-          name: DriveMad
-          path: DriveMad.nwa
+          name: NumDrive
+          path: NumDrive.nwa
       - name: Release tag
         id: tag
         run: |
@@ -43,10 +43,10 @@ jobs:
         if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
-          files: DriveMad.nwa
+          files: NumDrive.nwa
           tag_name: ${{ steps.tag.outputs.name }}
           target_commitish: ${{ github.sha }}
-          name: Drive Mad ${{ steps.tag.outputs.name }}
+          name: NumDrive ${{ steps.tag.outputs.name }}
           body: |
-            Drive Mad for the NumWorks N0120 calculator.
-            Install DriveMad.nwa from https://my.numworks.com/apps
+            NumDrive: Drive Mad for the NumWorks N0120 calculator.
+            Install NumDrive.nwa from https://my.numworks.com/apps
