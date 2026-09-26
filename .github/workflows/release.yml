@@ -1,8 +1,11 @@
 name: Build and release
 
+# Every push to main publishes the release named in VERSION (or the pushed v* tag); pull requests only build.
 on:
   push:
+    branches: [main]
     tags: ['v*']
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -31,12 +34,19 @@ jobs:
         with:
           name: DriveMad
           path: DriveMad.nwa
+      - name: Release tag
+        id: tag
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then tag="$GITHUB_REF_NAME"; else tag="v$(cat VERSION)"; fi
+          echo "name=$tag" >> "$GITHUB_OUTPUT"
       - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
           files: DriveMad.nwa
-          name: Drive Mad ${{ github.ref_name }}
+          tag_name: ${{ steps.tag.outputs.name }}
+          target_commitish: ${{ github.sha }}
+          name: Drive Mad ${{ steps.tag.outputs.name }}
           body: |
             Drive Mad for the NumWorks N0120 calculator.
             Install DriveMad.nwa from https://my.numworks.com/apps
