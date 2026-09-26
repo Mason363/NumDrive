@@ -181,7 +181,9 @@ static void s_wait_cmd(void) {
 }
 
 static void s_report(void) {
-  sr->score[s_id] = s_outcome == 1 ? 1e6f - frame : s_outcome == 2 ? -1e6f : cam.focus.x;
+  static float s_dir;
+  if (!s_dir) s_dir = getenv("ND_SDIR") ? atof(getenv("ND_SDIR")) : 1;
+  sr->score[s_id] = s_outcome == 1 ? 1e6f - frame : s_outcome == 2 ? -1e6f : cam.focus.x * s_dir;
   sr->cy[s_id] = cam.focus.y;
   sr->status[s_id] = s_outcome;
   __sync_synchronize();

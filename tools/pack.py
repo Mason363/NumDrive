@@ -10,6 +10,9 @@ import zlib
 import ops
 from deflate import raw_deflate, zop
 from fancade import Game, LEVEL, PHYSICS, SCRIPT
+
+# levels left out: their mechanics need parts turning out of the 2D plane (or they cannot be won here)
+SKIP = {115, 144, 158, 173}
 from model import BlockLib, build_objects, grid_cells, DIRS, vidx
 from scriptc import Compiler, custom_terminals
 
@@ -349,7 +352,8 @@ class Packer:
         self.records = [None]
         levels = []
         self.uses = {}
-        for L in range(200):
+        self.kept = [L for L in range(200) if L not in SKIP]
+        for L in self.kept:
             before = set(self.prog_record.values())
             rec = self.level_record(L)
             levels.append(len(self.records))
@@ -368,9 +372,9 @@ class Packer:
         for (name, t), i in sorted(self.comp.globals.items(), key=lambda kv: kv[1]):
             d.u8(t)
         d.u16(len(levels))
-        for i, r in enumerate(levels):
+        for L, r in zip(self.kept, levels):
             d.u16(r)
-            d.s(self.g.prefabs[i].name)
+            d.s(self.g.prefabs[L].name)
         # global variable names needed by the engine (index lookup)
         wanted = ['$Win', '$Lose', '$You', '$Cam', '$Offset']
         d.u8(len(wanted))
