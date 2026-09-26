@@ -12,6 +12,7 @@
 #include <signal.h>
 #include <sys/prctl.h>
 #include <math.h>
+#include <semaphore.h>
 #endif
 
 static uint16_t fb[SCREEN_W * SCREEN_H];
@@ -32,6 +33,7 @@ typedef struct {
   volatile float score[SW], cy[SW];
   volatile unsigned char path[SW][SPATH];
   volatile int plen[SW];
+  sem_t go[SW], done_sem; /* a worker sleeps on go[id]; the coordinator on done_sem */
 } Search;
 static Search *sr;
 static int s_seg, s_beam, s_frames, s_id = -1, s_act, s_outcome;
@@ -60,6 +62,8 @@ static void init(void) {
     max_frames = 1 << 30;
     sr = mmap(0, sizeof(Search), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     memset((void *)sr, 0, sizeof(Search));
+    for (int i = 0; i < SW; i++) sem_init(&sr->go[i], 1, 0);
+    sem_init(&sr->done_sem, 1, 0);
   }
 #endif
 }
@@ -155,7 +159,8 @@ void plat_frame_done(void) {
 
 static void s_wait_cmd(void) {
   for (;;) {
-    while (!sr->cmd[s_id]) usleep(100);
+    while (sem_wait(&sr->go[s_id]) != 0) {
+    }
     int c = sr->cmd[s_id];
     sr->cmd[s_id] = 0;
     if (c == 2) _exit(0);
@@ -181,13 +186,15 @@ static void s_report(void) {
   sr->status[s_id] = s_outcome;
   __sync_synchronize();
   sr->done[s_id] = 1;
+  sem_post(&sr->done_sem);
 }
 
 static void s_coordinate(void) {
   int beam[64], nb = 1, next = 1;
   if (s_beam > 64) s_beam = 64;
   beam[0] = 0;
-  while (!sr->done[0]) usleep(100);
+  while (sem_wait(&sr->done_sem) != 0) {
+  }
   for (int gen = 0; gen * s_seg < s_frames; gen++) {
     int kids[192], nk = 0;
     for (int i = 0; i < nb; i++) {
@@ -200,9 +207,11 @@ static void s_coordinate(void) {
       }
       __sync_synchronize();
       sr->cmd[beam[i]] = 1;
+      sem_post(&sr->go[beam[i]]);
     }
     for (int i = 0; i < nk; i++)
-      while (!sr->done[kids[i]]) usleep(100);
+      while (sem_wait(&sr->done_sem) != 0) {
+      }
     /* best first; a win ends the search */
     for (int i = 0; i < nk; i++)
       for (int j = i + 1; j < nk; j++)
@@ -217,7 +226,7 @@ static void s_coordinate(void) {
       for (int i = 0; i < sr->plen[best]; i++) putchar(".RL"[sr->path[best][i]]);
       putchar('\n');
       fflush(stdout);
-      for (int i = 0; i < nk; i++) sr->cmd[kids[i]] = 2;
+      for (int i = 0; i < nk; i++) sr->cmd[kids[i]] = 2, sem_post(&sr->go[kids[i]]);
       usleep(100000); /* let the workers go before their reaper does */
       exit(0);
     }
@@ -228,7 +237,7 @@ static void s_coordinate(void) {
       for (int j = 0; j < nb; j++)
         same += (int)floorf(sr->score[beam[j]]) == (int)floorf(sr->score[k]) && (int)floorf(sr->cy[beam[j]]) == (int)floorf(sr->cy[k]);
       if (nb < s_beam && sr->status[k] == 0 && same < 2) beam[nb++] = k;
-      else sr->cmd[k] = 2;
+      else sr->cmd[k] = 2, sem_post(&sr->go[k]);
     }
   }
   exit(0);

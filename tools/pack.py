@@ -81,24 +81,17 @@ class Packer:
             flags = min(s.collider, 2) | ((1 if s.type == PHYSICS else 0) << 2) | ((1 if id < self.g.id_offset else 0) << 3)
             w.u8(flags)
             w.u8(info.ncomp)
-            # per component voxel statistics (voxel units): count, sums of voxel centres, bounds
-            st = [[0, [0.0] * 3, [8, 8, 8, 0, 0, 0]] for _ in range(info.ncomp)]
+            # per component voxel bounds (voxel units)
+            st = [[8, 8, 8, 0, 0, 0] for _ in range(info.ncomp)]
             for i in range(512):
                 if not info.solid[i]:
                     continue
                 x, y, z = i & 7, (i >> 3) & 7, i >> 6
                 c = max(info.comp[i], 0) & 15 if info.ncomp > 1 else 0
-                e = st[c]
-                e[0] += 1
-                px, py, pz = x + 0.5, y + 0.5, z + 0.5
-                e[1][0] += px; e[1][1] += py; e[1][2] += pz
-                b = e[2]
+                b = st[c]
                 b[0] = min(b[0], x); b[1] = min(b[1], y); b[2] = min(b[2], z)
                 b[3] = max(b[3], x); b[4] = max(b[4], y); b[5] = max(b[5], z)
-            for cnt, sm, bb in st:
-                w.u16(cnt)
-                for v in sm:
-                    w.f32(v)
+            for bb in st:
                 w.b += bytes(bb)
             boxes = info.boxes()
             assert len(boxes) < 256

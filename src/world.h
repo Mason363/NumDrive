@@ -49,8 +49,6 @@ typedef struct {
   const uint8_t *fq[6]; /* quads per face, 3 bytes each */
   uint8_t nq[6];
   /* per component stats (voxel units) */
-  uint16_t *cnt;
-  float *sum;  /* ncomp * 3: sums of voxel centres */
   uint8_t *bb; /* ncomp * 6: min xyz, max xyz (inclusive) */
 } Block;
 
