@@ -335,7 +335,7 @@ vec3 shape_block_center(const Shape *s, int x, int y, int z) {
     uint32_t k = s->key[i];
     if (PK_X(k) != x || PK_Y(k) != y || PK_Z(k) != z) continue;
     const Block *b = blocks[s->blk[i]];
-    if (b->flags & 8) return v3(x + 0.5f, y + 0.5f, z + 0.5f); /* stock block: its cell */
+    if (b->flags & 8) return v3(x + 0.5f, y + 0.5f, z + 0.5f);
     const uint8_t *bb = b->bb + PK_C(k) * 6;
     for (int a = 0; a < 3; a++) {
       if (bb[a] < v0[a]) v0[a] = bb[a];
@@ -385,7 +385,7 @@ static void shape_finish(Shape *s) {
   s->com = m > 0 ? v3(sx / m / 8, sy / m / 8, sz / m / 8) : v3(0, 0, 0);
   {
     /* Fancade's object position: the centre of its bounds, where a stock block counts its whole cell
-       and a custom block its voxels (a thin plate at the bottom of its block sits low) */
+       and a custom block its voxels */
     float lo[3] = {1e9f, 1e9f, 1e9f}, hi[3] = {-1e9f, -1e9f, -1e9f};
     for (int i = 0; i < s->np; i++) {
       const Block *b = blocks[s->blk[i]];
@@ -399,6 +399,10 @@ static void shape_finish(Shape *s) {
       }
     }
     s->origin = s->np ? v3((lo[0] + hi[0]) * 0.5f, (lo[1] + hi[1]) * 0.5f, (lo[2] + hi[2]) * 0.5f) : s->com;
+    /* an object of one block sits at the centre of its cell */
+    bool one = true;
+    for (int i = 1; i < s->np && one; i++) one = (s->key[i] & ~7u) == (s->key[0] & ~7u);
+    if (s->np && one) s->origin = v3(PK_X(s->key[0]) + 0.5f, PK_Y(s->key[0]) + 0.5f, PK_Z(s->key[0]) + 0.5f);
   }
   s->bmin = v3(bx0 / 8, by0 / 8, bz0 / 8);
   s->bmax = v3(bx1 / 8, by1 / 8, bz1 / 8);

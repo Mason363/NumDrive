@@ -169,7 +169,7 @@ static bool ray_part(const Shape *s, int pi, vec3 o, vec3 d, float *best) {
     /* entering through a face shared with another box of the object (Fancade merges them) */
     float dl = sqrtf(vdot(d, d));
     float e = dl > 1e-9f ? 0.01f / dl : 0;
-    if (t > e && shape_solid_at(s, vadd(o, vscale(d, t - e)))) return false;
+    if (shape_solid_at(s, t > e ? vadd(o, vscale(d, t - e)) : o)) return false;
     *best = t;
     hit = true;
   }

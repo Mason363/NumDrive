@@ -221,11 +221,13 @@ static Env *child_env(Env *e, int node) {
 
 /* block position of this environment (for Get Position without object) */
 static void env_block_pose(Env *e, vec3 *pos, quat *rot) {
-  /* a script block's position is the centre of its model (a low plate for most) */
+  /* a script block's position is the centre of its model (a low plate for most); inside an object it is
+     that block's centre */
   vec3 rest = v3(e->bx + 7 / 16.0f, e->by + e->prog->yc / 16.0f, e->bz + 7 / 16.0f);
   if (e->anchor >= 0) {
+    /* the block's offset in its object is not turned with the object (scripts turn it themselves) */
     Obj *o = &objs[e->anchor];
-    *pos = obj_world(o, shape_block_center(o->shape, e->bx, e->by, e->bz));
+    *pos = vadd(o->pos, vsub(shape_block_center(o->shape, e->bx, e->by, e->bz), o->shape->origin));
     *rot = o->rot;
   } else {
     *pos = rest;

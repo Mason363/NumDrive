@@ -274,8 +274,9 @@ class Packer:
             outs.u16(self.ref(omap.get(k), selfmap))
         is_level = prog.pf.type == LEVEL
         # bits 1-4: height of the script block's model centre in 1/16 (its Get Position without object)
-        yc = 8
-        if prog.pf.vox is not None:
+        # (custom blocks with scripts use the standard script block model: 3/16)
+        yc = 3
+        if prog.pf.type == SCRIPT and prog.pf.vox is not None:
             ys = [y for z in range(8) for y in range(8) for x in range(8) if prog.pf.solid(x, y, z)]
             if ys:
                 yc = min(ys) + max(ys) + 1
