@@ -45,15 +45,17 @@ typedef struct Body {
   vec3 spin3;     /* extra free rotation (deg/s) about x,y for tumbling */
   uint8_t nel;
   uint8_t zmark;  /* scratch: already shifted in z */
+  int16_t wgrp;   /* scratch: bodies welded into one rigid assembly share it */
   Elem *el;
   float bound;    /* bounding radius around com */
   float zmin, zmax;
 } Body;
 
 typedef struct {
-  int a, b;               /* body indices; b may be -1 for static */
-  int sobj;               /* static object id when b == -1 */
-  float px, py;           /* world contact point */
+  int16_t a, b;           /* body indices; b may be -1 for static */
+  int16_t sobj;           /* static object id when b == -1 */
+  uint8_t acirc;          /* a touches with a circle: its lever reaches its own surface, p - n * depth */
+  float px, py;           /* world contact point (on b's surface) */
   float nx, ny;           /* normal from a to b (pointing out of b into a) */
   float depth;
   float mu, rest;
@@ -766,6 +768,7 @@ void phys_con_motor(int c, bool ang, vec3 v, vec3 f) {
 
 /* --------------------------------------------------------------- contacts */
 static int cur_a, cur_b, cur_sobj;
+static uint8_t cur_acirc;
 static float cur_mu, cur_rest;
 
 static void add_contact(float px, float py, float nx, float ny, float depth) {
@@ -778,6 +781,7 @@ static void add_contact(float px, float py, float nx, float ny, float depth) {
   c->a = cur_a;
   c->b = cur_b;
   c->sobj = cur_sobj;
+  c->acirc = cur_acirc;
   c->px = px;
   c->py = py;
   c->nx = nx;
@@ -962,6 +966,7 @@ static void col_bb(const WElem *A, const WElem *B) {
 
 static void collide_elems(const WElem *a, const WElem *b) {
   if (a->z1 <= b->z0 + 1e-4f || b->z1 <= a->z0 + 1e-4f) return;
+  cur_acirc = a->circle;
   if (a->circle && b->circle) col_cc(a, b);
   else if (a->circle) col_cb(a, b, false);
   else if (b->circle) col_cb(b, a, true);
@@ -1176,9 +1181,27 @@ static void collide_static(Body *bd, const WElem *we, int so) {
 }
 
 static bool joined(int a, int b) {
+  /* parts welded into one assembly behave as one body: they never push each other apart */
+  if (bodies[a].wgrp == bodies[b].wgrp) return true;
   for (int j = 0; j < njoints; j++)
     if ((joints[j].a == a && joints[j].b == b) || (joints[j].a == b && joints[j].b == a)) return true;
   return false;
+}
+
+static int wroot(int i) {
+  while (bodies[i].wgrp != i) i = bodies[i].wgrp = bodies[bodies[i].wgrp].wgrp;
+  return i;
+}
+
+static void weld_groups(void) {
+  for (int i = 0; i < nbodies; i++) bodies[i].wgrp = (int16_t)i;
+  for (int k = 0; k < njoints; k++) {
+    const Joint *j = &joints[k];
+    if (j->a < 0 || j->b < 0 || j->spring || j->lo[0] != j->hi[0] || j->lo[1] != j->hi[1] || j->lo[2] != j->hi[2]) continue;
+    int ra = wroot(j->a), rb = wroot(j->b);
+    if (ra != rb) bodies[ra].wgrp = (int16_t)rb;
+  }
+  for (int i = 0; i < nbodies; i++) bodies[i].wgrp = (int16_t)wroot(i);
 }
 
 /* like Bullet, a body does not collide with the static object its constraint is attached to */
@@ -1217,8 +1240,65 @@ static bool static_solid_at(vec3 w, int skip) {
   return false;
 }
 
+/* bodies turned out of the plane are outlined generously in 2D: check their parts really meet in 3D */
+static bool tilted(const Body *b) { return fabsf(b->m20) > 1e-3f || fabsf(b->m21) > 1e-3f; }
+
+static void elem_frame(const Body *b, const Elem *e, float c[3], float u[3][3], float h[3]) {
+  float cz = (e->z0 + e->z1) * 0.5f;
+  c[0] = b->x + b->m00 * e->cx + b->m01 * e->cy + b->m02 * cz;
+  c[1] = b->y + b->m10 * e->cx + b->m11 * e->cy + b->m12 * cz;
+  c[2] = b->z + b->m20 * e->cx + b->m21 * e->cy + b->m22 * cz;
+  float m[3][3] = {{b->m00, b->m10, b->m20}, {b->m01, b->m11, b->m21}, {b->m02, b->m12, b->m22}};
+  memcpy(u, m, sizeof m);
+  h[0] = e->hx, h[1] = e->circle ? e->hx : e->hy, h[2] = (e->z1 - e->z0) * 0.5f;
+}
+
+static bool elems_meet3d(const Body *A, const Elem *ea, const Body *B, const Elem *eb) {
+  const float M = 0.05f;
+  if (ea->circle && eb->circle) return true;
+  float ca[3], ua[3][3], ha[3], cb[3], ub[3][3], hb[3];
+  elem_frame(A, ea, ca, ua, ha);
+  elem_frame(B, eb, cb, ub, hb);
+  float t[3] = {cb[0] - ca[0], cb[1] - ca[1], cb[2] - ca[2]};
+  if (ea->circle || eb->circle) {
+    /* sphere against a box: the box's closest point */
+    const float(*u)[3] = ea->circle ? ub : ua;
+    const float *h = ea->circle ? hb : ha;
+    float r = ea->circle ? ha[0] : hb[0], sg = ea->circle ? -1.0f : 1.0f, d2 = 0;
+    for (int i = 0; i < 3; i++) {
+      float p = sg * (t[0] * u[i][0] + t[1] * u[i][1] + t[2] * u[i][2]), q = fabsf(p) - h[i];
+      if (q > 0) d2 += q * q;
+    }
+    return d2 < (r + M) * (r + M);
+  }
+  /* box against box: separating axes */
+  float R[3][3], AR[3][3], ta[3];
+  for (int i = 0; i < 3; i++) {
+    ta[i] = t[0] * ua[i][0] + t[1] * ua[i][1] + t[2] * ua[i][2];
+    for (int j = 0; j < 3; j++) {
+      R[i][j] = ua[i][0] * ub[j][0] + ua[i][1] * ub[j][1] + ua[i][2] * ub[j][2];
+      AR[i][j] = fabsf(R[i][j]) + 1e-5f;
+    }
+  }
+  for (int i = 0; i < 3; i++)
+    if (fabsf(ta[i]) > ha[i] + hb[0] * AR[i][0] + hb[1] * AR[i][1] + hb[2] * AR[i][2] + M) return false;
+  for (int j = 0; j < 3; j++)
+    if (fabsf(ta[0] * R[0][j] + ta[1] * R[1][j] + ta[2] * R[2][j]) > ha[0] * AR[0][j] + ha[1] * AR[1][j] + ha[2] * AR[2][j] + hb[j] + M)
+      return false;
+  for (int i = 0; i < 3; i++) {
+    int i1 = (i + 1) % 3, i2 = (i + 2) % 3;
+    for (int j = 0; j < 3; j++) {
+      int j1 = (j + 1) % 3, j2 = (j + 2) % 3;
+      float ra = ha[i1] * AR[i2][j] + ha[i2] * AR[i1][j], rb = hb[j1] * AR[i][j2] + hb[j2] * AR[i][j1];
+      if (fabsf(ta[i2] * R[i1][j] - ta[i1] * R[i2][j]) > ra + rb + M) return false;
+    }
+  }
+  return true;
+}
+
 static void gen_contacts(void) {
   ncon = 0;
+  weld_groups();
   for (int i = 0; i < nbodies; i++) {
     Body *A = &bodies[i];
     if (A->obj < 0 || (objs[A->obj].flags & (OF_COLLIDE | OF_VISIBLE)) != (OF_COLLIDE | OF_VISIBLE)) continue;
@@ -1264,6 +1344,7 @@ static void gen_contacts(void) {
       cur_rest = 0;
       for (int e = 0; e < na; e++) {
         const WElem *w = &wa[e];
+        cur_acirc = w->circle;
         if (w->circle) {
           if (w->cy < w->hx) add_contact(w->cx, 0, 0, 1, w->hx - w->cy);
           continue;
@@ -1292,8 +1373,10 @@ static void gen_contacts(void) {
       WElem wb[MAX_ELEMS];
       int nb = B->nel < MAX_ELEMS ? B->nel : MAX_ELEMS;
       for (int e = 0; e < nb; e++) elem_world(B, &B->el[e], &wb[e]);
+      bool t3 = tilted(A) || tilted(B);
       for (int e = 0; e < na; e++)
-        for (int f = 0; f < nb; f++) collide_elems(&wa[e], &wb[f]);
+        for (int f = 0; f < nb; f++)
+          if (!t3 || elems_meet3d(A, &A->el[e], B, &B->el[f])) collide_elems(&wa[e], &wb[f]);
     }
   }
 }
@@ -1328,8 +1411,10 @@ static void prep_contacts(void) {
     Contact *c = &con[i];
     Body *A = &bodies[c->a];
     Body *B = c->b >= 0 ? &bodies[c->b] : 0;
-    c->rax = c->px - A->x;
-    c->ray = c->py - A->y;
+    /* like Bullet, a wheel rolls on its full radius however deep it sits */
+    float sa = c->acirc ? c->depth : 0;
+    c->rax = c->px - c->nx * sa - A->x;
+    c->ray = c->py - c->ny * sa - A->y;
     if (B) {
       c->rbx = c->px - B->x;
       c->rby = c->py - B->y;
@@ -1742,7 +1827,7 @@ void phys_debug(int frame) {
     printf("f%d:", frame);
     for (int i = 0; i < ncon; i++) {
       Contact *c = &con[i];
-      printf(" b%d-s%d(%.2f,%.2f p=%.2f,%.2f jn=%.2f jt=%.2f mu=%.2f)", c->a, c->sobj, c->nx, c->ny, c->px, c->py, c->jn, c->jt, c->mu);
+      printf(" b%d-%c%d(%.2f,%.2f p=%.2f,%.2f jn=%.2f jt=%.2f mu=%.2f)", c->a, c->b >= 0 ? (char)98 : (char)115, c->b >= 0 ? c->b : c->sobj, c->nx, c->ny, c->px, c->py, c->jn, c->jt, c->mu);
     }
     printf("\n");
   }
