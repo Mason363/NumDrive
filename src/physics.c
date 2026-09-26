@@ -7,11 +7,9 @@
 vec3 phys_gravity = {0, -9.8f, 0};
 
 #define DT (1.0f / PHYS_HZ)
-#define MAX_BODIES 160
-#define MAX_ELEMS 64
-#define MAX_CONTACTS 384
-#define MAX_JOINTS 128
-#define MAX_EVENTS 96
+#define MAX_ELEMS 128   /* collision elements considered per body */
+#define MAX_CONTACTS 1024
+#define MAX_EVENTS 64
 #define ITER 10
 
 /* tunables (calibrated against the original game) */
@@ -23,10 +21,9 @@ float k_angular_damping = 0.0f;
 
 typedef struct {
   uint8_t circle;
-  float cx, cy;   /* centre relative to com, in the body base frame */
-  float ux, uy;   /* box x axis (unit) */
+  float cx, cy;   /* centre relative to com, in the body base frame (boxes are axis aligned there) */
   float hx, hy;   /* half extents (box) or radius in hx (circle) */
-  float z0, z1;   /* world z range */
+  float z0, z1;   /* z range relative to the com */
 } Elem;
 
 typedef struct Body {
@@ -62,26 +59,26 @@ typedef struct {
 typedef struct {
   int a, b;              /* body indices (a = base, may be -1 = world), b = part */
   vec3 la, lb;           /* anchors in rest frames (relative to com) */
-  vec3 axx, axy;         /* base frame axes in base rest frame */
+  vec3 axx;              /* base frame x axis in the base rest frame */
   float ref;             /* reference relative angle */
   float lo[3], hi[3];    /* x, y, angle limits (lo > hi = free) */
   float k[3], c[3];      /* springs (k == 0: none) */
   float mv[3], mf[3];    /* motor target velocity and max force */
-  float acc[3], accm[3], accl[3]; /* accumulated impulses: limit/lock, motor */
+  float acc[3], accm[3], accl[3]; /* accumulated impulses: spring, motor, limit/lock */
+  float spt[3], splo[3], sphi[3];   /* spring row target velocity and impulse range (per step) */
   uint8_t spring[3];
 } Joint;
 
-static Body bodies[MAX_BODIES];
-static int nbodies;
-static Elem elems_pool[MAX_BODIES * 8];
+/* per level pools (arena) */
+static Body *bodies;
+static int nbodies, body_cap;
 static int nelems;
-static Contact con[MAX_CONTACTS];
-static int ncon;
-static Joint joints[MAX_JOINTS];
-static int njoints;
+static Contact *con; /* scratch space, valid during a step */
+static int ncon, con_cap;
+static Joint *joints;
+static int njoints, joint_cap;
 static struct { int16_t a, b; float imp; float nx, ny; } events[MAX_EVENTS];
 static int nevents;
-static int16_t body_of[MAX_OBJ];
 
 /* ---------------------------------------------------------------- raycast */
 static bool ray_box(vec3 o, vec3 d, vec3 mn, vec3 mx, float *tin) {
@@ -276,13 +273,21 @@ static void sync_body(Body *b) {
 }
 
 /* add collision elements for a shape, expressed in the body base frame relative to the com */
-static void build_elems(Body *b) {
+static bool build_elems(Body *b) {
   Obj *o = &objs[b->obj];
   const Shape *s = o->shape;
-  b->el = &elems_pool[nelems];
+  int cap = 0;
+  for (int i = 0; i < s->np; i++) {
+    const Block *bk = blocks[s->blk[i]];
+    if ((bk->flags & 3) == 2) cap++;
+    else if (bk->flags & 3) cap += bk->nbox;
+  }
+  if (cap > 255) cap = 255;
+  uint32_t mark = arena_mark();
+  b->el = arena_alloc(sizeof(Elem) * (cap ? cap : 1));
+  if (!b->el) return false;
   b->nel = 0;
-  int cap = (int)(sizeof elems_pool / sizeof elems_pool[0]);
-  for (int i = 0; i < s->np && nelems + b->nel < cap; i++) {
+  for (int i = 0; i < s->np && b->nel < cap; i++) {
     const Block *bk = blocks[s->blk[i]];
     int coll = bk->flags & 3;
     if (!coll) continue;
@@ -298,14 +303,12 @@ static void build_elems(Body *b) {
       e->cy = c.y - s->com.y;
       e->hx = rad;
       e->hy = rad;
-      e->ux = 1;
-      e->uy = 0;
       e->z0 = c.z - s->com.z - rad;
       e->z1 = c.z - s->com.z + rad;
       continue;
     }
     const uint8_t *bx = bk->boxes;
-    for (int j = 0; j < bk->nbox && nelems + b->nel < cap; j++, bx += 3) {
+    for (int j = 0; j < bk->nbox && b->nel < cap; j++, bx += 3) {
       uint32_t wv = bx[0] | bx[1] << 8 | (uint32_t)bx[2] << 16;
       if ((int)(wv & 7) != comp) continue;
       float mnx = PK_X(k) + ((wv >> 3) & 7) / 8.0f, mny = PK_Y(k) + ((wv >> 6) & 7) / 8.0f, mnz = PK_Z(k) + ((wv >> 9) & 7) / 8.0f;
@@ -315,8 +318,6 @@ static void build_elems(Body *b) {
       e->circle = 0;
       e->cx = (mnx + mxx) * 0.5f - s->com.x;
       e->cy = (mny + mxy) * 0.5f - s->com.y;
-      e->ux = 1;
-      e->uy = 0;
       e->hx = (mxx - mnx) * 0.5f;
       e->hy = (mxy - mny) * 0.5f;
       e->z0 = mnz - s->com.z;
@@ -349,6 +350,8 @@ static void build_elems(Body *b) {
       }
     }
   }
+  arena_release(mark);
+  arena_alloc(sizeof(Elem) * (b->nel ? b->nel : 1)); /* keep only the merged elements */
   nelems += b->nel;
   b->bound = 0;
   for (int i = 0; i < b->nel; i++) {
@@ -356,6 +359,7 @@ static void build_elems(Body *b) {
     float r = sqrtf(e->cx * e->cx + e->cy * e->cy) + (e->circle ? e->hx : sqrtf(e->hx * e->hx + e->hy * e->hy));
     if (r > b->bound) b->bound = r;
   }
+  return true;
 }
 
 static void body_zrange(Body *b) {
@@ -402,25 +406,28 @@ static void body_mass(Body *b) {
 void phys_make_dynamic(int o) {
   if (o < 0 || o >= nobj) return;
   Obj *ob = &objs[o];
-  if ((ob->flags & OF_DYNAMIC) || (ob->flags & OF_DEAD) || nbodies >= MAX_BODIES) return;
-  ob->flags |= OF_DYNAMIC;
-  int bi = nbodies++;
-  Body *b = &bodies[bi];
+  if ((ob->flags & OF_DYNAMIC) || (ob->flags & OF_DEAD)) return;
+  if (nbodies >= body_cap) {
+    OOM("bodies");
+    return;
+  }
+  Body *b = &bodies[nbodies];
   memset(b, 0, sizeof *b);
   b->obj = o;
-  body_of[o] = bi;
   sync_body(b);
   b->lockx = (ob->lockp & 1) ? 1.0f : 0.0f;
   b->locky = (ob->lockp & 2) ? 1.0f : 0.0f;
   b->lockr = (ob->lockr & 4) ? 1.0f : 0.0f;
   body_mass(b);
-  build_elems(b);
+  if (!build_elems(b)) return;
   body_zrange(b);
+  ob->flags |= OF_DYNAMIC;
+  ob->body = (int16_t)nbodies++;
 }
 
 static Body *body(int o) {
   if (o < 0 || o >= nobj || !(objs[o].flags & OF_DYNAMIC)) return 0;
-  int bi = body_of[o];
+  int bi = objs[o].body;
   if (bi < 0 || bi >= nbodies || bodies[bi].obj != o) return 0;
   return &bodies[bi];
 }
@@ -441,15 +448,23 @@ void phys_reset(void) {
   host_tunables();
 #endif
   phys_gravity = v3(0, -9.8f, 0);
-  nbodies = 0;
+  nbodies = body_cap = 0;
   nelems = 0;
-  njoints = 0;
+  njoints = joint_cap = 0;
   ncon = 0;
   nevents = 0;
-  for (int i = 0; i < MAX_OBJ; i++) body_of[i] = -1;
 }
 
 void phys_start(void) {
+  /* pools sized from the capacities measured for this level */
+  int nphys = 0;
+  for (int i = 0; i < nobj; i++)
+    if (objs[i].flags & OF_PHYSICS) nphys++;
+  body_cap = level.body_cap > nphys ? level.body_cap : nphys;
+  joint_cap = level.joint_cap;
+  bodies = arena_alloc(sizeof(Body) * (body_cap ? body_cap : 1));
+  joints = arena_alloc(sizeof(Joint) * (joint_cap ? joint_cap : 1));
+  if (!bodies || !joints) body_cap = joint_cap = 0;
   for (int i = 0; i < nobj; i++) {
     Obj *o = &objs[i];
     if ((o->flags & OF_PHYSICS) && !(o->flags & (OF_TEMPLATE | OF_DEAD))) phys_make_dynamic(i);
@@ -528,12 +543,15 @@ void phys_destroyed(int o) {
   for (int j = 0; j < njoints; j++)
     if (joints[j].a == bi || joints[j].b == bi) joints[j].b = -2;
   b->obj = -1;
-  body_of[o] = -1;
+  objs[o].body = -1;
 }
 
 /* ----------------------------------------------------------------- joints */
 int phys_add_constraint(int base, int part, vec3 pivot) {
-  if (njoints >= MAX_JOINTS) return -1;
+  if (njoints >= joint_cap) {
+    OOM("joints");
+    return -1;
+  }
   phys_make_dynamic(part);
   Body *pb = body(part);
   if (!pb) return -1;
@@ -545,11 +563,9 @@ int phys_add_constraint(int base, int part, vec3 pivot) {
   if (bb) {
     j->la = qrot(qconj(bb->rot), vsub(pivot, v3(bb->x, bb->y, bb->z)));
     j->axx = qrot(qconj(bb->rot), v3(1, 0, 0));
-    j->axy = qrot(qconj(bb->rot), v3(0, 1, 0));
   } else {
     j->la = pivot;
     j->axx = v3(1, 0, 0);
-    j->axy = v3(0, 1, 0);
   }
   j->lb = qrot(qconj(pb->rot), vsub(pivot, v3(pb->x, pb->y, pb->z)));
   j->ref = pb->a - (bb ? bb->a : 0);
@@ -606,7 +622,10 @@ static int cur_a, cur_b, cur_sobj;
 static float cur_mu, cur_rest;
 
 static void add_contact(float px, float py, float nx, float ny, float depth) {
-  if (ncon >= MAX_CONTACTS) return;
+  if (ncon >= con_cap) {
+    OOM("contacts");
+    return;
+  }
   Contact *c = &con[ncon++];
   memset(c, 0, sizeof *c);
   c->a = cur_a;
@@ -1159,15 +1178,18 @@ static void solve_joints(bool first) {
         imp += j->accm[k] - old;
         rv += (j->accm[k] - old) / m;
       }
-      /* spring (soft constraint towards 0) */
+      /* spring: Bullet's 6DofSpring2 row, velocity target rv0 + f with the impulse clamped to f */
       if (j->spring[k] && (free_ || lo < hi)) {
-        float kk = j->k[k], cc = j->c[k];
-        float gamma = DT * (cc + DT * kk);
-        gamma = gamma > 0 ? 1.0f / gamma : 0;
-        float beta = DT * kk * gamma;
-        float ms = 1.0f / (1.0f / m + gamma);
-        float d = -ms * (rv + beta * err[k] + gamma * j->acc[k]);
-        j->acc[k] += d;
+        if (first) {
+          float fd = -j->c[k] * rv * DT, f = -j->k[k] * err[k] * DT + fd;
+          j->spt[k] = rv + f;
+          j->splo[k] = fminf(fminf(f, fd), 0);
+          j->sphi[k] = fmaxf(fmaxf(f, fd), 0);
+        }
+        float d = m * (j->spt[k] - rv);
+        float old = j->acc[k];
+        j->acc[k] = clampf(old + d, j->splo[k], j->sphi[k]);
+        d = j->acc[k] - old;
         imp += d;
         rv += d / m;
       }
@@ -1208,6 +1230,11 @@ static void solve_joints(bool first) {
 
 /* ------------------------------------------------------------------- step */
 void phys_step(void) {
+  /* contacts live in the free arena space: nothing is allocated during a step */
+  uint32_t avail;
+  con = arena_top(&avail);
+  con_cap = (int)(avail / sizeof(Contact));
+  if (con_cap > MAX_CONTACTS) con_cap = MAX_CONTACTS;
   /* external forces */
   for (int i = 0; i < nbodies; i++) {
     Body *b = &bodies[i];
@@ -1294,6 +1321,9 @@ bool phys_collision(int o, int *other, float *impulse, vec3 *normal) {
 int st_bodies, st_joints, st_con, st_elems, st_obj, st_elem_body;
 static void stats_dump(void) {
   extern uint32_t arena_peak;
+  extern int st_obj_setup;
+  extern uint32_t st_arena_setup;
+  printf("STATS setup_arena=%u setup_obj=%d ", st_arena_setup, st_obj_setup);
   printf("STATS arena=%u obj=%d bodies=%d joints=%d con=%d elems=%d maxel=%d\n", arena_peak, st_obj, st_bodies,
          st_joints, st_con, st_elems, st_elem_body);
 }
@@ -1322,6 +1352,17 @@ void phys_debug(int frame) {
     printf("%d:%.2f,%.2f,%.0f ", frame, b->x - x0, b->y - y0, b->a * 57.3f);
     if (frame % 100 == 0) printf("\n");
     fflush(stdout);
+  }
+  if (getenv("ND_JDBG") && frame >= 60 && frame < 130) {
+    printf("f%d", frame);
+    for (int ji = 0; ji < njoints; ji++) {
+      Joint *j = &joints[ji];
+      Body *A, *B;
+      float rax, ray, rbx, rby, cx, cy, ex, ey, ang;
+      joint_frame(j, &A, &B, &rax, &ray, &rbx, &rby, &cx, &cy, &ex, &ey, &ang);
+      printf(" j%d:%.3f", ji, ey);
+    }
+    printf(" ncon=%d\n", ncon);
   }
   if (getenv("ND_CON") && frame >= 90 && frame < 170) {
     printf("f%d:", frame);

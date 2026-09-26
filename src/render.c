@@ -24,6 +24,12 @@ static uint16_t cbuf[SCREEN_W * STRIP_H];
 static uint16_t zbuf[SCREEN_W * STRIP_H];
 static int strip_y0, strip_y1; /* current strip rows [y0, y1) */
 static int clip_x0, clip_x1;
+/* per object, per frame: screen rows covered and part cache offset */
+typedef struct {
+  int16_t ymin, ymax;
+  uint16_t pcache;
+} RObj;
+static RObj *robj;
 
 uint16_t rgb565(int r, int g, int b) {
   if (r > 255) r = 255;
@@ -44,9 +50,13 @@ void shade_color(int pal, vec3 n, int *r, int *g, int *b) {
   *b = (int)(c[2] * (AMB[2] + k * LEFF[2]) + 0.5f);
 }
 
+static uint16_t axis_col[34 * 6];
+static uint8_t axis_ok[34 * 6 / 8 + 1];
+
 void light_set(const quat *rot) {
   vec3 d = qrot(*rot, v3(0, 0, 1));
   light_to = vscale(d, -1);
+  memset(axis_ok, 0, sizeof axis_ok);
 }
 
 /* ------------------------------------------------------------------ camera */
@@ -113,52 +123,89 @@ void cam_screen_to_world(float sx, float sy, vec3 *near, vec3 *far) {
 #define ZOFF 48.0f
 #define ZSCALE 512.0f
 
-static void raster(const float *sx, const float *sy, float z0, float zx, float zy, uint16_t color) {
-  float ymin = sy[0], ymax = sy[0];
-  for (int i = 1; i < 4; i++) {
-    if (sy[i] < ymin) ymin = sy[i];
-    if (sy[i] > ymax) ymax = sy[i];
-  }
-  int y0 = (int)ceilf(ymin - 0.5f), y1 = (int)ceilf(ymax - 0.5f);
+static inline int iceil(float v) {
+  int i = (int)v;
+  return i + (v > (float)i);
+}
+
+/* Rasterise the parallelogram P0 + s*U + t*V (s, t in [0,1)) with a planar depth.
+ * ds/dx, ds/dy, dt/dx, dt/dy map screen offsets from P0 to (s, t); ix* are 1/(ds/dx), 1/(dt/dx). */
+typedef struct {
+  float dsdx, dsdy, dtdx, dtdy, isx, itx;
+} PInv;
+
+static void raster(float X0, float Y0, float ux, float uy, float vx, float vy, const PInv *pi, float z0, float zx,
+                   float zy, uint16_t color) {
+  float ymin = Y0, ymax = Y0;
+  float ya = Y0 + uy, yb = Y0 + vy, yc2 = Y0 + uy + vy;
+  if (ya < ymin) ymin = ya;
+  if (ya > ymax) ymax = ya;
+  if (yb < ymin) ymin = yb;
+  if (yb > ymax) ymax = yb;
+  if (yc2 < ymin) ymin = yc2;
+  if (yc2 > ymax) ymax = yc2;
+  int y0 = iceil(ymin - 0.5f), y1 = iceil(ymax - 0.5f);
   if (y0 < strip_y0) y0 = strip_y0;
   if (y1 > strip_y1) y1 = strip_y1;
   if (y0 >= y1) return;
-  /* depth in fixed point: Z(x,y) = (z0 + zx*(x - sx0) + zy*(y - sy0) + ZOFF) * ZSCALE */
-  float zbase = (z0 + ZOFF - zx * sx[0] - zy * sy[0]) * ZSCALE;
+  /* depth in fixed point: Z(x,y) = (z0 + zx*(x - X0) + zy*(y - Y0) + ZOFF) * ZSCALE */
+  float zbase = (z0 + ZOFF - zx * X0 - zy * Y0) * ZSCALE;
   int32_t dz = (int32_t)(zx * ZSCALE * 256.0f);
-  for (int y = y0; y < y1; y++) {
-    float yc = y + 0.5f;
-    float xl = 1e9f, xr = -1e9f;
-    for (int i = 0; i < 4; i++) {
-      int j = (i + 1) & 3;
-      float ya = sy[i], yb = sy[j];
-      if ((yc >= ya && yc < yb) || (yc >= yb && yc < ya)) {
-        float x = sx[i] + (yc - ya) * (sx[j] - sx[i]) / (yb - ya);
-        if (x < xl) xl = x;
-        if (x > xr) xr = x;
-      }
+  float dy = y0 + 0.5f - Y0;
+  float sr = pi->dsdy * dy, tr = pi->dtdy * dy; /* s, t at (X0, row centre) */
+  for (int y = y0; y < y1; y++, sr += pi->dsdy, tr += pi->dtdy) {
+    float xl, xr;
+    if (pi->isx != 0) {
+      float a = -sr * pi->isx, b = (1 - sr) * pi->isx;
+      if (a < b) xl = a, xr = b;
+      else xl = b, xr = a;
+    } else {
+      if (sr < 0 || sr >= 1) continue;
+      xl = -1e9f, xr = 1e9f;
     }
-    if (xl > xr) continue;
-    int x0 = (int)ceilf(xl - 0.5f), x1 = (int)ceilf(xr - 0.5f);
+    if (pi->itx != 0) {
+      float a = -tr * pi->itx, b = (1 - tr) * pi->itx;
+      if (a > b) {
+        float t = a;
+        a = b;
+        b = t;
+      }
+      if (a > xl) xl = a;
+      if (b < xr) xr = b;
+    } else if (tr < 0 || tr >= 1) {
+      continue;
+    }
+    if (xl >= xr) continue;
+    int x0 = iceil(X0 + xl - 0.5f), x1 = iceil(X0 + xr - 0.5f);
     if (x0 < clip_x0) x0 = clip_x0;
     if (x1 > clip_x1) x1 = clip_x1;
     if (x0 >= x1) continue;
+    float yc = y + 0.5f;
     float zs = zbase + (zx * (x0 + 0.5f) + zy * yc) * ZSCALE;
     if (zs < 0) zs = 0;
     int32_t z = (int32_t)(zs * 256.0f);
     int row = (y - strip_y0) * SCREEN_W;
-    uint16_t *c = cbuf + row + x0;
+    uint16_t *c = cbuf + row + x0, *ce = cbuf + row + x1;
     uint16_t *zp = zbuf + row + x0;
-    for (int x = x0; x < x1; x++) {
-      uint32_t zz = (uint32_t)z >> 8;
-      if (zz > 65535) zz = 65535;
-      if (zz <= *zp) {
-        *zp = (uint16_t)zz;
-        *c = color;
+    int32_t zend = z + dz * (x1 - x0 - 1);
+    if (z >= 0 && zend >= 0 && z < (65535 << 8) && zend < (65535 << 8)) {
+      for (; c < ce; c++, zp++, z += dz) {
+        uint16_t zz = (uint16_t)(z >> 8);
+        if (zz <= *zp) {
+          *zp = zz;
+          *c = color;
+        }
       }
-      c++;
-      zp++;
-      z += dz;
+    } else {
+      for (; c < ce; c++, zp++, z += dz) {
+        int32_t zz = z >> 8;
+        if (zz < 0) zz = 0;
+        if (zz > 65535) zz = 65535;
+        if ((uint16_t)zz <= *zp) {
+          *zp = (uint16_t)zz;
+          *c = color;
+        }
+      }
     }
   }
 }
@@ -172,6 +219,8 @@ typedef struct {
   uint8_t colok[34 * 6 / 8 + 1];
   vec3 n[6];
   float zx[6], zy[6];
+  float fa[6], fb[6], fc[6], fd[6], fia[6], fic[6]; /* per face: (s,t) per screen unit, for 1 voxel quads */
+  uint8_t ident;                                  /* unrotated: shared colour cache */
 } ObjXf;
 
 static ObjXf xf;
@@ -196,17 +245,38 @@ static void setup_xf(const Obj *o) {
     xf.n[f] = n;
     float nf = vdot(n, cam.fwd);
     if (nf < -1e-4f) {
+      int axis = f >> 1, ua = axis == 0 ? 1 : 0, va = axis == 2 ? 1 : 2;
+      float eux = xf.bx[ua] * 0.125f, euy = xf.by[ua] * 0.125f, evx = xf.bx[va] * 0.125f, evy = xf.by[va] * 0.125f;
+      float det = eux * evy - euy * evx;
+      if (fabsf(det) < 1e-6f) continue;
+      float id = 1.0f / det;
+      xf.fa[f] = evy * id;
+      xf.fb[f] = -evx * id;
+      xf.fc[f] = -euy * id;
+      xf.fd[f] = eux * id;
+      xf.fia[f] = fabsf(xf.fa[f]) > 1e-6f ? 1.0f / xf.fa[f] : 0;
+      xf.fic[f] = fabsf(xf.fc[f]) > 1e-6f ? 1.0f / xf.fc[f] : 0;
       xf.vis |= 1 << f;
       float nr = vdot(n, cam.right), nu = vdot(n, cam.up);
       xf.zx[f] = -nr / (cam.scale * nf);
       xf.zy[f] = nu / (cam.scale * nf);
     }
   }
-  memset(xf.colok, 0, sizeof xf.colok);
+  xf.ident = fabsf(o->rot.x) + fabsf(o->rot.y) + fabsf(o->rot.z) < 1e-5f;
+  if (!xf.ident) memset(xf.colok, 0, sizeof xf.colok);
 }
 
 static uint16_t face_color(int pal, int f) {
   int i = pal * 6 + f;
+  if (xf.ident) {
+    if (!(axis_ok[i >> 3] & (1 << (i & 7)))) {
+      int r, g, b;
+      shade_color(pal, xf.n[f], &r, &g, &b);
+      axis_col[i] = rgb565(r, g, b);
+      axis_ok[i >> 3] |= 1 << (i & 7);
+    }
+    return axis_col[i];
+  }
   if (!(xf.colok[i >> 3] & (1 << (i & 7)))) {
     int r, g, b;
     shade_color(pal, xf.n[f], &r, &g, &b);
@@ -226,21 +296,26 @@ static inline void proj(float vx, float vy, float vz, float *sx, float *sy, floa
   *sz = xf.oz + xf.bz[0] * vx + xf.bz[1] * vy + xf.bz[2] * vz;
 }
 
+static const float inv_n[9] = {0, 1, 0.5f, 1.0f / 3, 0.25f, 0.2f, 1.0f / 6, 1.0f / 7, 0.125f};
+
 static void draw_part(const Shape *s, int pi) {
   uint32_t k = s->key[pi];
   const Block *b = blocks[s->blk[pi]];
   int cx = PK_X(k) * 8, cy = PK_Y(k) * 8, cz = PK_Z(k) * 8, comp = PK_C(k);
-  /* quick strip reject using the cell centre */
-  float sx, sy, sz;
-  proj(cx + 4, cy + 4, cz + 4, &sx, &sy, &sz);
+  /* quick strip reject using the cell centre (rows first) */
   float r = 0.9f * cam.scale;
-  if (sy + r < strip_y0 || sy - r > strip_y1 || sx + r < clip_x0 || sx - r > clip_x1) return;
+  float vx = (cx + 4) * 0.125f, vy = (cy + 4) * 0.125f, vz = (cz + 4) * 0.125f;
+  float sy = xf.oy + xf.by[0] * vx + xf.by[1] * vy + xf.by[2] * vz;
+  if (sy + r < strip_y0 || sy - r > strip_y1) return;
+  float sx = xf.ox + xf.bx[0] * vx + xf.bx[1] * vy + xf.bx[2] * vz;
+  if (sx + r < clip_x0 || sx - r > clip_x1) return;
   uint8_t occ = s->occ ? s->occ[pi] : 0;
   for (int f = 0; f < 6; f++) {
     if (!(xf.vis & (1 << f)) || !b->nq[f]) continue;
     const uint8_t *q = b->fq[f];
     int axis = f >> 1, ua = axis == 0 ? 1 : 0, va = axis == 2 ? 1 : 2;
     int pos = !(f & 1);
+    float eux = xf.bx[ua] * 0.125f, euy = xf.by[ua] * 0.125f, evx = xf.bx[va] * 0.125f, evy = xf.by[va] * 0.125f;
     for (int i = 0; i < b->nq[f]; i++, q += 3) {
       uint32_t w = q[0] | q[1] << 8 | (uint32_t)q[2] << 16;
       int layer = w & 7, u = (w >> 3) & 7, v = (w >> 6) & 7, du = ((w >> 9) & 7) + 1, dv = ((w >> 12) & 7) + 1;
@@ -251,37 +326,71 @@ static void draw_part(const Shape *s, int pi) {
       p[axis] = (float)(layer + pos);
       p[ua] = (float)u;
       p[va] = (float)v;
-      float c0[3] = {cx + p[0], cy + p[1], cz + p[2]};
-      float X[4], Y[4], Z;
-      proj(c0[0], c0[1], c0[2], &X[0], &Y[0], &Z);
-      float eux = xf.bx[ua] * du * 0.125f, euy = xf.by[ua] * du * 0.125f;
-      float evx = xf.bx[va] * dv * 0.125f, evy = xf.by[va] * dv * 0.125f;
-      X[1] = X[0] + eux;
-      Y[1] = Y[0] + euy;
-      X[2] = X[1] + evx;
-      Y[2] = Y[1] + evy;
-      X[3] = X[0] + evx;
-      Y[3] = Y[0] + evy;
-      raster(X, Y, Z, xf.zx[f], xf.zy[f], face_color(col, f));
+      float X, Y, Z;
+      proj(cx + p[0], cy + p[1], cz + p[2], &X, &Y, &Z);
+      PInv pv;
+      float iu = inv_n[du], iv = inv_n[dv];
+      pv.dsdx = xf.fa[f] * iu;
+      pv.dsdy = xf.fb[f] * iu;
+      pv.dtdx = xf.fc[f] * iv;
+      pv.dtdy = xf.fd[f] * iv;
+      pv.isx = xf.fia[f] * du;
+      pv.itx = xf.fic[f] * dv;
+      raster(X, Y, eux * du, euy * du, evx * dv, evy * dv, &pv, Z, xf.zx[f], xf.zy[f], face_color(col, f));
     }
   }
 }
 
-static void draw_object(const Obj *o) {
-  setup_xf(o);
-  const Shape *s = o->shape;
-  for (int i = 0; i < s->np; i++) draw_part(s, i);
+/* per frame cache of the strips each part may touch (one byte per part: first << 4 | last), kept in
+ * the free arena space which is untouched while rendering */
+static uint8_t *pc_base;
+static uint32_t pc_avail, pc_used;
+
+
+static void draw_object(Obj *ob, RObj *o) {
+  setup_xf(ob);
+  const Shape *s = ob->shape;
+  if (o->pcache == 0xFFFF && pc_used + s->np <= pc_avail && pc_used + s->np < 0xFFFF) {
+    uint8_t *pc = pc_base + pc_used;
+    float r = 0.9f * cam.scale;
+    for (int i = 0; i < s->np; i++) {
+      uint32_t k = s->key[i];
+      float vy = PK_Y(k) + 0.5f, vx = PK_X(k) + 0.5f, vz = PK_Z(k) + 0.5f;
+      float sy = xf.oy + xf.by[0] * vx + xf.by[1] * vy + xf.by[2] * vz;
+      int a = (int)floorf((sy - r) * (1.0f / STRIP_H)), b = (int)floorf((sy + r) * (1.0f / STRIP_H));
+      if (b < 0 || a > SCREEN_H / STRIP_H - 1) {
+        pc[i] = 0xF0;
+        continue;
+      }
+      if (a < 0) a = 0;
+      if (b > 15) b = 15;
+      pc[i] = (uint8_t)(a << 4 | b);
+    }
+    o->pcache = (uint16_t)pc_used;
+    pc_used += s->np;
+  }
+  if (o->pcache != 0xFFFF) {
+    const uint8_t *pc = pc_base + o->pcache;
+    int st = strip_y0 / STRIP_H;
+    for (int i = 0; i < s->np; i++)
+      if (st >= (pc[i] >> 4) && st <= (pc[i] & 15)) draw_part(s, i);
+  } else {
+    for (int i = 0; i < s->np; i++) draw_part(s, i);
+  }
 }
 
 /* ------------------------------------------------------------------ frame */
 static bool obj_screen_bounds(const Obj *o, int *y0, int *y1, int *x0, int *x1);
 
-void render_init_level(void) {
+bool render_init_level(void) {
+  robj = arena_alloc(sizeof(RObj) * (obj_cap ? obj_cap : 1));
+  if (!robj) return false;
   int r = palette_rgb[level.bg][0], g = palette_rgb[level.bg][1], b = palette_rgb[level.bg][2];
   r = r + (255 - r) * 2 / 5;
   g = g + (255 - g) * 2 / 5;
   b = b + (255 - b) * 2 / 5;
   sky565 = rgb565(r, g, b);
+  return true;
 }
 
 static bool obj_screen_bounds(const Obj *o, int *y0, int *y1, int *x0, int *x1) {
@@ -305,23 +414,27 @@ static bool obj_screen_bounds(const Obj *o, int *y0, int *y1, int *x0, int *x1) 
   return !(mxx < 0 || mnx > SCREEN_W || mxy < 0 || mny > SCREEN_H);
 }
 
-static int16_t ymin_buf[MAX_OBJ], ymax_buf[MAX_OBJ];
 
 void render_prepare(int rx0, int rx1) {
+  pc_base = arena_top(&pc_avail);
+  pc_used = 0;
   for (int i = 0; i < nobj; i++) {
-    const Obj *o = &objs[i];
-    ymin_buf[i] = 1;
-    ymax_buf[i] = 0;
+    Obj *o = &objs[i];
+    RObj *r = &robj[i];
+    r->pcache = 0xFFFF;
+    r->ymin = 1;
+    r->ymax = 0;
     if (!(o->flags & OF_VISIBLE) || (o->flags & OF_DEAD) || !o->shape->np) continue;
     int y0, y1, x0, x1;
     if (!obj_screen_bounds(o, &y0, &y1, &x0, &x1)) continue;
     if (x1 < rx0 || x0 > rx1) continue;
-    ymin_buf[i] = y0;
-    ymax_buf[i] = y1;
+    r->ymin = (int16_t)(y0 < -32000 ? -32000 : y0);
+    r->ymax = (int16_t)(y1 > 32000 ? 32000 : y1);
   }
 }
 
 uint16_t *render_buffer(void) { return cbuf; }
+void *render_scratch(void) { return zbuf; } /* depth buffer, free between frames */
 
 uint16_t *render_strip(int sy, int n, int x0, int x1) {
   strip_y0 = sy;
@@ -336,8 +449,9 @@ uint16_t *render_strip(int sy, int n, int x0, int x1) {
     }
   }
   for (int i = 0; i < nobj; i++) {
-    if (ymin_buf[i] > ymax_buf[i] || ymax_buf[i] < strip_y0 || ymin_buf[i] >= strip_y1) continue;
-    draw_object(&objs[i]);
+    RObj *r = &robj[i];
+    if (r->ymin > r->ymax || r->ymax < strip_y0 || r->ymin >= strip_y1) continue;
+    draw_object(&objs[i], r);
   }
   return cbuf;
 }

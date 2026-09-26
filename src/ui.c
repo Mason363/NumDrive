@@ -140,16 +140,22 @@ void viewfinder_draw(uint16_t *px, int y, int n, int t) {
 /* ------------------------------------------------------------ background */
 #define BW 40
 #define BH 30
-static uint8_t blur[BH][BW][3];
+static uint8_t (*blur)[BW][3]; /* allocated from the level arena when a menu first opens */
 
 void ui_capture_background(void) {
   static uint16_t acc[BW][3];
+  static int blur_level = -1;
+  if (!blur || blur_level != level_serial) {
+    blur = arena_keep_alloc(sizeof(uint8_t) * BH * BW * 3);
+    blur_level = level_serial;
+  }
+  if (!blur) return;
   cam_view(SCREEN_W * 0.5f, SCREEN_H * 0.5f, 1, 0);
   render_prepare(0, SCREEN_W);
   for (int sy = 0; sy < SCREEN_H; sy += STRIP_H) {
     int n = SCREEN_H - sy < STRIP_H ? SCREEN_H - sy : STRIP_H;
     uint16_t *b = render_strip(sy, n, 0, SCREEN_W);
-    for (int by = 0; by < n / 8; by++) {
+    for (int by = 0; by < n / 8; by++) { /* STRIP_H is a multiple of 8 */
       memset(acc, 0, sizeof acc);
       for (int r = 0; r < 8; r++) {
         const uint16_t *row = b + (by * 8 + r) * SCREEN_W;
@@ -169,8 +175,8 @@ void ui_capture_background(void) {
     }
   }
   /* soften: two separable box passes */
+  uint8_t(*t)[BW][3] = render_scratch();
   for (int pass = 0; pass < 2; pass++) {
-    static uint8_t t[BH][BW][3];
     for (int y = 0; y < BH; y++)
       for (int x = 0; x < BW; x++)
         for (int k = 0; k < 3; k++) {
@@ -189,6 +195,10 @@ void ui_capture_background(void) {
 /* one screen row of the blurred background, columns [x0, x1) */
 static void bg_row(uint16_t *dst, int y, int x0, int x1) {
   static uint16_t row[BW][3];
+  if (!blur) {
+    for (int x = x0; x < x1; x++) dst[x] = sky565;
+    return;
+  }
   int ty = 2 * y + 1 - 8, iy = ty >> 4, wy = ty & 15;
   if (iy < 0) iy = 0, wy = 0;
   if (iy >= BH - 1) iy = BH - 2, wy = 16;

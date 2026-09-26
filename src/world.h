@@ -6,6 +6,14 @@
 
 #define NONE16 0xFFFF
 
+/* out-of-memory reporting on the host harness */
+#ifdef HOST
+#include <stdio.h>
+#define OOM(what) do { static int once; if (!once++) fprintf(stderr, "OOM %s\n", what); } while (0)
+#else
+#define OOM(what) do { } while (0)
+#endif
+
 /* ------------------------------------------------------------------ arena */
 void *arena_alloc(uint32_t size);
 #if defined(HOST) && defined(ARENA_PROFILE) && !defined(ARENA_IMPL)
@@ -13,9 +21,14 @@ void *arena_alloc_dbg(uint32_t size, const char *f, int l);
 #define arena_alloc(n) arena_alloc_dbg((n), __FILE__, __LINE__)
 #endif
 void arena_reset(void);
+void *arena_tmp_alloc(uint32_t size); /* setup-only data, freed after the level is instantiated */
+void arena_tmp_reset(void);
+void *arena_keep_alloc(uint32_t size); /* after setup: allocation kept until the next level */
+extern int level_serial;
 uint32_t arena_used(void);
 uint32_t arena_mark(void);
 void arena_release(uint32_t mark);
+bool arena_extend(void *p, uint32_t old_size, uint32_t new_size); /* grow the last allocation in place */
 void *arena_top(uint32_t *avail); /* scratch space at the top of the arena */
 
 /* ------------------------------------------------------------------- pack */
@@ -57,20 +70,16 @@ extern Block *blocks[256]; /* loaded blocks by library index (NULL if unused) */
 /* A set of voxel-block parts forming one object shape (shared by clones). */
 typedef struct {
   uint16_t np;
+  uint8_t coll;    /* 1 if any part collides */
+  uint8_t sphere;  /* shape is a single sphere */
   uint32_t *key;   /* x<<20 | y<<13 | z<<3 | comp  (cell coords), sorted */
   uint8_t *blk;    /* library index per part */
   uint8_t *occ;    /* per part: faces hidden by a full neighbour face of the same shape */
   float mass;
+  float radius;    /* sphere radius */
   vec3 com;        /* rest-space centre of mass (world units) */
   vec3 origin;     /* rest-space reference point (centre of the block nearest the com) */
   vec3 bmin, bmax; /* rest-space bounds (world units) */
-  float inertia;   /* about z through com */
-  uint8_t coll;    /* 1 if any part collides */
-  uint8_t sphere;  /* shape is a single sphere */
-  float radius;
-  vec3 scen;       /* sphere centre (rest) */
-  uint16_t nbox;   /* collision boxes (rest space, voxel units, only built for movable shapes) */
-  int16_t *box;    /* 6 per box: x0 y0 z0 x1 y1 z1 (voxel units, exclusive max) */
 } Shape;
 
 #define PK_X(k) ((k) >> 20)
@@ -83,21 +92,19 @@ enum {
   OF_VISIBLE = 1, OF_COLLIDE = 2, OF_PHYSICS = 4, OF_DYNAMIC = 8, OF_TEMPLATE = 16, OF_DEAD = 32, OF_MOVED = 64
 };
 
-struct Body;
 typedef struct {
   Shape *shape;
-  uint16_t flags;
-  vec3 pos;   /* world position of the shape origin */
+  vec3 pos; /* world position of the shape origin */
   quat rot;
-  struct Body *body;
-  float friction, bounce;
-  float mass;
-  uint8_t lockp, lockr; /* allowed axes bits (x=1,y=2,z=4) for position / rotation */
+  float friction, bounce, mass;
+  uint16_t flags;
   uint16_t src;         /* object this was cloned from (or itself) */
+  int16_t body;         /* physics body index or -1 */
+  uint8_t lockp, lockr; /* allowed axes bits (x=1,y=2,z=4) for position / rotation */
 } Obj;
 
-#define MAX_OBJ 1400
-extern Obj objs[MAX_OBJ];
+extern Obj *objs;
+extern int obj_cap;
 extern int nobj;
 extern int nlevelobj;
 
@@ -128,13 +135,10 @@ typedef struct Prog {
   Shape **tmpl;
   uint16_t *slot;       /* per node output slot (or NONE16) */
   uint16_t nslots;
-  struct Prog **child;  /* per node: child program for CUSTOM nodes */
-  /* grid for self-reference resolution (inner objects) */
-  uint16_t ncells;
-  uint32_t *cellkey;    /* z<<20|y<<10|x sorted (grid coords) */
-  uint8_t *cellblk;
-  uint16_t *cellobj;    /* object (template) index of comp 0; multi-comp resolved via objcomp */
+  const uint8_t *objdata; /* template objects (see scan_objects) */
 } Prog;
+
+Prog *prog_child(const Prog *p, int node); /* child program of a CUSTOM node, else NULL */
 
 typedef struct Env Env;
 
@@ -142,6 +146,7 @@ typedef struct Env Env;
 typedef struct {
   char name[40];
   uint16_t sx, sy, sz;
+  uint16_t body_cap, joint_cap; /* physics capacities measured for this level */
   uint8_t bg;
   Prog *prog;
   int index;
@@ -155,8 +160,6 @@ const char *level_name(int i);
 bool world_init(void);
 bool world_load_level(int index);
 
-/* find the object id of the component at (cell, voxel) in a program grid (level: level objects) */
-int world_obj_at(Prog *p, uint16_t tbase, int cx, int cy, int cz, int vx, int vy, int vz);
 
 /* global variables */
 extern uint16_t nglobals;

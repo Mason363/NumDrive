@@ -1,3 +1,4 @@
+import os
 """Build the NumDrive data pack from the original Drive Mad game file.
 
 Usage: python3 pack.py [--fast] [out.c]
@@ -50,6 +51,7 @@ class Packer:
         self.block_index = {}   # segment id -> library index
         self.records = []       # raw record bytes
         self.prog_record = {}   # prefab id -> record index
+        self.children = {}      # program record -> child program records
 
     # ---------------------------------------------------------------- blocks
     def blk(self, id):
@@ -176,6 +178,41 @@ class Packer:
             return 3 << 13 | r[1]
         raise ValueError(r)
 
+    @staticmethod
+    def varint(w, v):
+        while v >= 0x80:
+            w.u8((v & 0x7F) | 0x80)
+            v >>= 7
+        w.u8(v)
+
+    def write_objects(self, w, prog):
+        """Objects of a grid, already grouped (same glue rules and order as the original).
+        u16 count, varint part count per object, then all part blocks (u8), then all part key deltas
+        (varint, key = x<<20 | y<<13 | z<<3 | component, parts of an object sorted by key)."""
+        w.u16(len(prog.objects))
+        blocks, deltas = W(), W()
+        for o in prog.objects:
+            parts = sorted((c[0] << 20 | c[1] << 13 | c[2] << 3 | k, self.blk(id)) for (c, id, k) in o.parts)
+            self.varint(w, len(parts))
+            prev = 0
+            for key, b in parts:
+                blocks.u8(b)
+                self.varint(deltas, key - prev)
+                prev = key
+        w.b += blocks.b + deltas.b
+
+    def custom_objects(self, body, prog, n):
+        """object indices (in the parent grid) of a custom block's anchor and self references"""
+        child = self.comp.program(n.custom_prog)
+        bx, by, bz = n.pos
+        a = self.comp.object_at(prog, (bx, by, bz), (4, 4, 4))
+        body.u16(0xFFFF if a is None else a)
+        body.u8(len(child.selfmap))
+        for v, i in sorted(child.selfmap.items(), key=lambda kv: kv[1]):
+            cell = (bx + v[0] // 8, by + v[1] // 8, bz + v[2] // 8)
+            o = self.comp.object_at(prog, cell, (v[0] % 8, v[1] % 8, v[2] % 8))
+            body.u16(0xFFFF if o is None else o)
+
     def program_record(self, pid):
         if pid in self.prog_record:
             return self.prog_record[pid]
@@ -187,6 +224,7 @@ class Packer:
         idx = len(self.records)
         self.records.append(None)
         self.prog_record[pid] = idx
+        self.children[idx] = [self.prog_record[n.custom_prog] for n in prog.nodes if n.op == ops.OP_CUSTOM]
         w = W()
         selfmap = {}
         body = W()
@@ -198,6 +236,7 @@ class Packer:
                 body.u8(len(n.ins))
                 for r in n.ins:
                     body.u16(self.ref(r, selfmap))
+                self.custom_objects(body, prog, n)
                 continue
             for r in n.ins:
                 body.u16(self.ref(r, selfmap))
@@ -248,9 +287,9 @@ class Packer:
         for v, i in sorted(selfmap.items(), key=lambda kv: kv[1]):
             w.u8(v[0]); w.u8(v[1]); w.u8(v[2])
         if not is_level:
-            self.write_grid(w, prog.pf)
+            self.write_objects(w, prog)
         else:
-            w.u16(0xFFFF)
+            w.u16(0)
         w.b += body.b
         prog.selfmap = selfmap
         self.records[idx] = bytes(w.b)
@@ -267,19 +306,50 @@ class Packer:
         w.u16(lv.size[0]); w.u16(lv.size[1]); w.u16(lv.size[2])
         w.u8(lv.bg)
         w.u16(self.prog_record[lv.id])
-        self.write_grid(w, lv)
-        w.u16(len(prog.objects))
-        nlevel = len(prog.objects)
+        # capacities measured by the host harness (objects, physics bodies, joints)
+        oc, bc, jc = self.caps.get(L, (600, 64, 64))
+        w.u16(oc); w.u16(bc); w.u16(jc)
+        self.write_objects(w, prog)
         return bytes(w.b)
 
+    def reachable(self, rec):
+        """program records reachable from a program record (itself and custom block children)"""
+        out, todo = set(), [rec]
+        while todo:
+            r = todo.pop()
+            if r in out:
+                continue
+            out.add(r)
+            todo += self.children.get(r, [])
+        return out
+
+    def load_caps(self):
+        """caps.txt: 'level obj bodies joints' peak counts from host/caps.sh; add safety margins"""
+        self.caps = {}
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'caps.txt')
+        if not os.path.exists(path):
+            return
+        for line in open(path):
+            f = line.split()
+            if len(f) != 4:
+                continue
+            L, o, b, j = map(int, f)
+            self.caps[L] = (o + max(16, o // 8), b + max(4, b // 8), j + max(4, j // 8))
+
     def build(self):
+        self.load_caps()
         # record 0: directory (filled last)
         self.records = [None]
         levels = []
+        self.uses = {}
         for L in range(200):
+            before = set(self.prog_record.values())
             rec = self.level_record(L)
             levels.append(len(self.records))
             self.records.append(rec)
+            lv = self.g.prefabs[L]
+            for r in self.reachable(self.prog_record[lv.id]):
+                self.uses[r] = self.uses.get(r, 0) + 1
         groups = self.block_library()
         first_block = len(self.records)
         self.records += groups
@@ -307,8 +377,13 @@ class Packer:
         return self.records
 
     def serialize(self):
+        # records read in place from flash (no RAM copy): the directory and programs used by most levels
+        self.raw = {0} | {r for r, n in self.uses.items() if n >= 100}
         comp = []
-        for r in self.records:
+        for i, r in enumerate(self.records):
+            if i in self.raw:
+                comp.append(r)
+                continue
             c = raw_deflate(r) if self.fast else zop(r)
             comp.append(c)
         out = W()
@@ -320,8 +395,8 @@ class Packer:
             out.u32(off)
             off += len(c)
         out.u32(off)
-        for r in self.records:
-            out.u32(len(r))
+        for i, r in enumerate(self.records):
+            out.u32(len(r) | (0x80000000 if i in self.raw else 0))
         for c in comp:
             out.b += c
         return bytes(out.b)

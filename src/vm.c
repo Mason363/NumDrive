@@ -123,11 +123,15 @@ static void var_write(VarStore *vs, int idx, const Val *v) {
   if (idx >= vs->cap) {
     int nc = vs->cap ? vs->cap : 1;
     while (nc <= idx) nc *= 2;
-    uint8_t *nd = arena_alloc(nc * es);
-    if (!nd) return;
-    if (vs->len) memcpy(nd, vs->data, vs->len * es);
-    vs->data = nd;
-    vs->cap = nc;
+    if (vs->data && arena_extend(vs->data, vs->cap * es, nc * es)) {
+      vs->cap = nc;
+    } else {
+      uint8_t *nd = arena_alloc(nc * es);
+      if (!nd) return;
+      if (vs->len) memcpy(nd, vs->data, vs->len * es);
+      vs->data = nd;
+      vs->cap = nc;
+    }
   }
   while (vs->len <= idx) {
     Val d;
@@ -851,7 +855,7 @@ extern int world_add_template(Shape *s);
 static int count_envs(Prog *p) {
   int n = 1;
   for (int i = 0; i < p->nnodes; i++)
-    if (p->child[i]) n += count_envs(p->child[i]);
+    if (prog_child(p, i)) n += count_envs(prog_child(p, i));
   return n;
 }
 
@@ -872,13 +876,16 @@ static bool make_env(Prog *p, int parent, int pnode, int bx, int by, int bz) {
     e->tbase = nobj;
     for (int t = 0; t < p->ntmpl; t++)
       if (world_add_template(p->tmpl[t]) < 0) return false;
-    /* anchor: object owning the block cell in the parent grid */
-    int a = world_obj_at(pp->is_level ? 0 : pp, pe->tbase, bx, by, bz, 4, 4, 4);
-    e->anchor = a;
+    /* anchor and self objects, resolved by the pack tool as indices in the parent grid */
+    const uint8_t *nd = node_ptr(pp, pnode);
+    const uint8_t *ob = nd + 10 + 2 * nd[9];
+    uint16_t a = rd16(ob);
+    e->anchor = a == NONE16 ? -1 : pe->tbase + a;
     e->selfobj = arena_alloc(2 * (p->nself ? p->nself : 1));
+    if (!e->selfobj) return false;
     for (int k = 0; k < p->nself; k++) {
-      const uint8_t *v = p->selfvox + 3 * k;
-      e->selfobj[k] = world_obj_at(pp->is_level ? 0 : pp, pe->tbase, bx, by, bz, v[0], v[1], v[2]);
+      uint16_t o = k < ob[2] ? rd16(ob + 3 + 2 * k) : NONE16;
+      e->selfobj[k] = o == NONE16 ? -1 : pe->tbase + o;
     }
   }
   e->locals = arena_alloc(sizeof(VarStore) * (p->nlocals ? p->nlocals : 1));
@@ -894,9 +901,10 @@ static bool make_env(Prog *p, int parent, int pnode, int bx, int by, int bz) {
     for (int k = 0; k < p->nslots; k++) val_default(&e->slots[k], T_NUM);
   }
   for (int i = 0; i < p->nnodes; i++) {
-    if (!p->child[i]) continue;
+    Prog *ch = prog_child(p, i);
+    if (!ch) continue;
     const uint8_t *nd = node_ptr(p, i);
-    if (!make_env(p->child[i], idx, i, rd16(nd + 3), rd16(nd + 5), rd16(nd + 7))) return false;
+    if (!make_env(ch, idx, i, rd16(nd + 3), rd16(nd + 5), rd16(nd + 7))) return false;
   }
   return true;
 }

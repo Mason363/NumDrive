@@ -35,7 +35,7 @@ static bool start_level(int i) {
   cam_default();
   if (!world_load_level(i)) return false;
   phys_start();
-  render_init_level();
+  if (!render_init_level()) return false;
   hud_reset();
   if (progress.last != i) {
     progress.last = (uint8_t)i;
@@ -65,9 +65,16 @@ static void hud_post(uint16_t *px, int y, int n) {
 
 extern bool level_unlocked(int i);
 
+#ifdef ARMTEST
+extern char **environ;
+#endif
+
 int main(int argc, char **argv) {
   (void)argc;
   (void)argv;
+#ifdef ARMTEST
+  environ = argv + 1; /* semihosting has no environment: pass KEY=VALUE arguments */
+#endif
   if (!world_init()) return 1;
   save_load();
   int lvl = progress.last < nlevels ? progress.last : 0;
@@ -144,7 +151,12 @@ int main(int argc, char **argv) {
         win_timer = lose_timer = -1;
         continue;
       }
-      render_frame(hud_post);
+#ifdef HOST
+      static int norender = -1;
+      if (norender < 0) norender = getenv("ND_NORENDER") != 0;
+      if (!norender)
+#endif
+        render_frame(hud_post);
     } else if (state == ST_CARD) {
       if (card_buttons() == 2) {
         if ((hit & KEY(K_LEFT)) && sel) sel = 0, dirty = true;
