@@ -76,7 +76,8 @@ class Packer:
         if True:
             info = self.lib.get(id)
             s = self.g.seg(id)
-            flags = min(s.collider, 2) | ((1 if s.type == PHYSICS else 0) << 2)
+            # bit 3: stock block (its position counts its whole cell)
+            flags = min(s.collider, 2) | ((1 if s.type == PHYSICS else 0) << 2) | ((1 if id < self.g.id_offset else 0) << 3)
             w.u8(flags)
             w.u8(info.ncomp)
             bits = bytearray(64)
@@ -272,7 +273,13 @@ class Packer:
         for k in range(len(prog.outputs_decl)):
             outs.u16(self.ref(omap.get(k), selfmap))
         is_level = prog.pf.type == LEVEL
-        w.u8(1 if is_level else 0)
+        # bits 1-4: height of the script block's model centre in 1/16 (its Get Position without object)
+        yc = 8
+        if prog.pf.vox is not None:
+            ys = [y for z in range(8) for y in range(8) for x in range(8) if prog.pf.solid(x, y, z)]
+            if ys:
+                yc = min(ys) + max(ys) + 1
+        w.u8((1 if is_level else 0) | yc << 1)
         w.u16(len(prog.nodes))
         w.u16(len(prog.entries))
         for e in prog.entries:

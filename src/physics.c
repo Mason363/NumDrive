@@ -41,6 +41,7 @@ typedef struct Body {
   float lockx, locky, lockr; /* 1 free, 0 locked */
   vec3 spin3;     /* extra free rotation (deg/s) about x,y for tumbling */
   uint8_t nel;
+  uint8_t zmark;  /* scratch: already shifted in z */
   Elem *el;
   float bound;    /* bounding radius around com */
   float zmin, zmax;
@@ -583,8 +584,29 @@ void phys_set_gravity(vec3 g) { phys_gravity = g; }
 void phys_moved(int o) {
   Body *b = body(o);
   if (!b) return;
-  float m02 = b->m02, m12 = b->m12, m20 = b->m20, m21 = b->m21;
+  float m02 = b->m02, m12 = b->m12, m20 = b->m20, m21 = b->m21, z0 = b->z;
   sync_body(b);
+  /* the joints hold depth: bodies jointed to a body moved in z go with it */
+  float dz = b->z - z0;
+  if (fabsf(dz) > 1e-4f) {
+    for (int i = 0; i < nbodies; i++) bodies[i].zmark = 0;
+    b->zmark = 1;
+    for (bool more = true; more;) {
+      more = false;
+      for (int ji = 0; ji < njoints; ji++) {
+        Joint *j = &joints[ji];
+        if (j->a < 0 || j->b < 0 || bodies[j->a].zmark == bodies[j->b].zmark) continue;
+        Body *m = bodies[j->a].zmark ? &bodies[j->b] : &bodies[j->a];
+        if (m->obj < 0) continue;
+        m->zmark = 1;
+        m->z += dz;
+        sync_obj(m);
+        body_zrange(m);
+        more = true;
+      }
+    }
+    body_zrange(b);
+  }
   /* turned about x or y: the inertia about the plane normal changes */
   if (fabsf(m02 - b->m02) + fabsf(m12 - b->m12) + fabsf(m20 - b->m20) + fabsf(m21 - b->m21) > 1e-3f) {
     body_mass(b);

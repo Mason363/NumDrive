@@ -221,7 +221,8 @@ static Env *child_env(Env *e, int node) {
 
 /* block position of this environment (for Get Position without object) */
 static void env_block_pose(Env *e, vec3 *pos, quat *rot) {
-  vec3 rest = v3(e->bx + 0.5f, e->by + 0.5f, e->bz + 0.5f);
+  /* a script block's position is the centre of its model (a low plate for most) */
+  vec3 rest = v3(e->bx + 7 / 16.0f, e->by + e->prog->yc / 16.0f, e->bz + 7 / 16.0f);
   if (e->anchor >= 0) {
     Obj *o = &objs[e->anchor];
     *pos = obj_world(o, shape_block_center(o->shape, e->bx, e->by, e->bz));
@@ -631,6 +632,9 @@ static void exec_stmt(Env *e, int ni) {
       Val v;
       eval(e, node_in(nd, 0), &v);
       deref(&v);
+      /* a value wired from an input the outer script left unconnected changes nothing (scripts use
+         "set a default, then set the input" for optional inputs) */
+      if (v.t == 0xff && node_in(nd, 0) != NONE16) return;
       if (v.t != vs->type && !(vs->type == T_CON && v.t == T_OBJ)) val_default(&v, vs->type);
       var_write(vs, 0, &v);
       return;
@@ -642,6 +646,7 @@ static void exec_stmt(Env *e, int ni) {
       if (!ptr.isptr) return;
       eval(e, node_in(nd, 1), &v);
       deref(&v);
+      if (v.t == 0xff && node_in(nd, 1) != NONE16) return;
       if (v.t != ptr.u.p.vs->type && !(ptr.u.p.vs->type == T_CON && v.t == T_OBJ)) val_default(&v, ptr.u.p.vs->type);
       var_write(ptr.u.p.vs, ptr.u.p.idx, &v);
       return;

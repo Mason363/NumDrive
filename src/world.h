@@ -119,6 +119,7 @@ static inline vec3 obj_local(const Obj *o, vec3 w) {
 /* --------------------------------------------------------------- programs */
 typedef struct Prog {
   uint8_t is_level;
+  uint8_t yc; /* model centre height of a script block, in 1/16 */
   uint16_t rec;
   uint16_t nnodes;
   uint16_t *off;        /* node offsets into data */

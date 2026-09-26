@@ -327,14 +327,16 @@ int shape_find(const Shape *s, int x, int y, int z) {
   return -1;
 }
 
-/* Fancade's position of a block in an object is the centre of that block's voxels (a thin plate
-   lying at the bottom of its block has its position near the bottom) */
+/* position of one block of an object: its cell for a stock block, the centre of its voxels for a
+   custom one */
 vec3 shape_block_center(const Shape *s, int x, int y, int z) {
   int v0[3] = {8, 8, 8}, v1[3] = {-1, -1, -1};
   for (int i = 0; i < s->np; i++) {
     uint32_t k = s->key[i];
     if (PK_X(k) != x || PK_Y(k) != y || PK_Z(k) != z) continue;
-    const uint8_t *bb = blocks[s->blk[i]]->bb + PK_C(k) * 6;
+    const Block *b = blocks[s->blk[i]];
+    if (b->flags & 8) return v3(x + 0.5f, y + 0.5f, z + 0.5f); /* stock block: its cell */
+    const uint8_t *bb = b->bb + PK_C(k) * 6;
     for (int a = 0; a < 3; a++) {
       if (bb[a] < v0[a]) v0[a] = bb[a];
       if (bb[a + 3] > v1[a]) v1[a] = bb[a + 3];
@@ -382,18 +384,21 @@ static void shape_finish(Shape *s) {
   s->mass = m / 512.0f;
   s->com = m > 0 ? v3(sx / m / 8, sy / m / 8, sz / m / 8) : v3(0, 0, 0);
   {
-    float bd = 1e30f;
-    s->origin = s->com;
+    /* Fancade's object position: the centre of its bounds, where a stock block counts its whole cell
+       and a custom block its voxels (a thin plate at the bottom of its block sits low) */
+    float lo[3] = {1e9f, 1e9f, 1e9f}, hi[3] = {-1e9f, -1e9f, -1e9f};
     for (int i = 0; i < s->np; i++) {
-      vec3 c = v3(PK_X(s->key[i]) + 0.5f, PK_Y(s->key[i]) + 0.5f, PK_Z(s->key[i]) + 0.5f);
-      vec3 d = vsub(c, s->com);
-      float dd = vdot(d, d);
-      if (dd < bd - 1e-6f) {
-        bd = dd;
-        s->origin = c;
+      const Block *b = blocks[s->blk[i]];
+      uint32_t k = s->key[i];
+      const uint8_t *bb = b->bb + PK_C(k) * 6;
+      int c[3] = {PK_X(k), PK_Y(k), PK_Z(k)};
+      for (int a = 0; a < 3; a++) {
+        float l = (b->flags & 8) ? c[a] : c[a] + bb[a] / 8.0f, h = (b->flags & 8) ? c[a] + 1 : c[a] + (bb[a + 3] + 1) / 8.0f;
+        if (l < lo[a]) lo[a] = l;
+        if (h > hi[a]) hi[a] = h;
       }
     }
-    s->origin = shape_block_center(s, (int)s->origin.x, (int)s->origin.y, (int)s->origin.z);
+    s->origin = s->np ? v3((lo[0] + hi[0]) * 0.5f, (lo[1] + hi[1]) * 0.5f, (lo[2] + hi[2]) * 0.5f) : s->com;
   }
   s->bmin = v3(bx0 / 8, by0 / 8, bz0 / 8);
   s->bmax = v3(bx1 / 8, by1 / 8, bz1 / 8);
@@ -469,7 +474,8 @@ static Prog *load_prog(int rec) {
   progs[rec] = p;
   p->rec = rec;
   const uint8_t *q = d;
-  p->is_level = q[0];
+  p->is_level = q[0] & 1;
+  p->yc = q[0] >> 1;
   p->nnodes = rd16(q + 1);
   p->nentries = rd16(q + 3);
   p->entries = q + 5;
