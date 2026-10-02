@@ -47,3 +47,7 @@ The app is written to `output/device/numdrive.nwa`.
 Made by Mason Chen. Inspired by Drive Mad.
 
 This is an unofficial fan game and is not affiliated with the makers of Drive Mad.
+
+## License
+
+NumDrive is licensed under the [GNU General Public License v3.0](LICENSE). Copyright (c) 2026 Mason Chen. Third-party parts keep their own licenses, as noted in their source files.
